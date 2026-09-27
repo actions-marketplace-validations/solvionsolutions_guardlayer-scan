@@ -176,9 +176,11 @@ export const supabaseRules: Rule[] = [
     category: "supabase",
     cwe: "CWE-285",
     message:
-      "A public table is created but RLS is never enabled for it in this migration. RLS is the last line of defense for tables reachable through Supabase's auto-generated API — without it, an exposed table can be read and written by anyone holding the public anon key.",
+      "A public table is created but RLS is never enabled for it in this migration. This is the exact gap behind the largest study of its kind: UpGuard found 16,326 Supabase databases exposing readable tables to the open web (2026-09-25), over half showing signs of personal data. Tables created through the Supabase Dashboard get RLS enabled by default — tables created with SQL do NOT, and AI coding agents create tables with SQL. Without RLS, an exposed table can be read and written by anyone holding the public anon key.",
     recommendation:
-      "Add ALTER TABLE <table> ENABLE ROW LEVEL SECURITY; plus access policies right after the CREATE TABLE.",
+      "Add ALTER TABLE <table> ENABLE ROW LEVEL SECURITY; plus access policies right after the CREATE TABLE. If RLS is enabled in a different migration file, this warning is expected — the scanner reads one file at a time and cannot see it.",
+    reference:
+      "https://techcrunch.com/2026/09/25/some-supabase-customers-are-publicly-exposing-reams-of-peoples-data-to-the-web/",
     appliesTo: (f) => isSql(f.path),
     scan: (f) => {
       const matches: RuleMatch[] = [];

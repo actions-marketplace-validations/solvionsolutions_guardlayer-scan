@@ -82,6 +82,12 @@ const KNOWN_VULN_DEPS: {
   fixedBelow?: [number, number, number];
   fixedByMajor?: Record<number, [number, number, number]>;
   fixedByBranch?: Record<string, [number, number, number]>;
+  /** A floor INSIDE a prerelease line, e.g. 5.0.0-beta.32. `parseVersion` drops
+   *  the tag, so `5.0.0-beta.31` (vulnerable) and `-beta.32` (patched) both
+   *  collapse to [5,0,0] and are invisible to every numeric compare above. This
+   *  is the only way to catch a critical advisory that is fixed within a beta
+   *  line, which is where next-auth v5 has lived for a long time. */
+  fixedByPrerelease?: { base: string; tag: string; below: number };
   advisory: string;
 }[] = [
   {
@@ -90,12 +96,28 @@ const KNOWN_VULN_DEPS: {
     // the August 2026 release (published 2026-08-25): two CRITICAL unauthenticated
     // RCEs — Image Optimization via a crafted AVIF (GHSA-2xp9-vwfh-vxw4, upstream
     // libheif/sharp) and Windows-hosted servers (CVE-2026-75604, no workaround).
-    // NOTE: 16.2.11 — the PREVIOUS floor — is itself vulnerable, so the 16 key
+    // NOTE: 16.2.11 — an EARLIER floor — is itself vulnerable, so the 16 key
     // must point at the 16.3 branch, not 16.2. 14.x and older have no fix branch,
     // so any major below 15 is flagged outright.
-    fixedByMajor: { 15: [15, 5, 24], 16: [16, 3, 3] },
+    //
+    // 2026-09-22 out-of-band update: CVE-2026-94545 (CVSS 9.5, CRITICAL) — RCE in
+    // the Node.js `ImageResponse` from next/og, via improper SVG escaping in
+    // upstream Satori. Affected `>=16.2.0 <16.3.6`, so the 16 floor moves
+    // 16.3.3 -> 16.3.6. Next.js 15.x is explicitly NOT affected by this RCE
+    // (15.5.26 is hardening only), so the 15 floor deliberately STAYS at 15.5.24
+    // — raising it would flag 15.5.24/.25 for a bug they do not have.
+    fixedByMajor: { 15: [15, 5, 24], 16: [16, 3, 6] },
     advisory:
-      "Two CRITICAL unauthenticated RCE advisories from the August 2026 security release — Image Optimization via a crafted AVIF image (GHSA-2xp9-vwfh-vxw4, upstream libheif) and Windows-hosted servers using Pages Router + App Router without Cache Components (CVE-2026-75604, no known workaround) — on top of the July 2026 set (CVE-2026-64641 through CVE-2026-64649) and the earlier CVE-2025-29927 bypass. Patch to 15.5.24+ or 16.3.3+; 14.x and older have no fix branch.",
+      "CRITICAL RCE in the Node.js ImageResponse from next/og — CVE-2026-94545 / GHSA-vcvr-r3jv-pc5j (CVSS 9.5), via improper SVG escaping in upstream Satori; affects >=16.2.0 <16.3.6 (the Edge implementation is unaffected). On top of the August 2026 pair of critical unauthenticated RCEs (GHSA-2xp9-vwfh-vxw4 AVIF Image Optimization, CVE-2026-75604 Windows-hosted servers), the July 2026 set (CVE-2026-64641 through CVE-2026-64649) and the earlier CVE-2025-29927 middleware bypass. Patch to 16.3.6+ (16.x) or 15.5.24+ (15.x); 14.x and older have no fix branch. Note a further nine-vulnerability release (16.3.7 / 15.5.27) is scheduled for 2026-09-30.",
+  },
+  {
+    // The upstream package behind CVE-2026-94545. Next.js bundles its own copy
+    // (covered by the `next` floor above), so this entry is for apps that depend
+    // on satori DIRECTLY to generate OG images.
+    name: "satori",
+    fixedBelow: [0, 33, 5],
+    advisory:
+      "CVE-2026-94545 / GHSA-wx4j-mvgx-mqwp (Moderate, CVSS 5.3): satori does not properly escape certain values before including them in generated SVG output, so crafted input can be interpreted as SVG markup. Downstream this became a critical RCE in Next.js next/og. Affects >=0.0.27 <0.33.5 — upgrade to 0.33.5; there is no complete workaround besides upgrading.",
   },
   {
     name: "@supabase/auth-js",
@@ -135,14 +157,14 @@ const KNOWN_VULN_DEPS: {
   },
   {
     name: "next-auth",
-    // v5 is deliberately absent. parseVersion strips the prerelease tag, so
-    // 5.0.0-beta.31 (vulnerable) and 5.0.0-beta.32 (patched) both parse to
-    // [5,0,0] — indistinguishable, and a `5` key would be a coin flip. With only
-    // a `4` key, depFixTarget sees major 5 > minMajor 4 and returns null, so v5
-    // betas stay silent. An under-report, never a false positive.
+    // v4 uses the numeric branch floor; the v5 BETA line needs prerelease-aware
+    // comparison, because beta.31 (vulnerable) and beta.32 (patched) both parse
+    // to [5,0,0]. A 5.0.0 stable release matches neither and stays silent, which
+    // is correct — the fix landed before stable.
     fixedByMajor: { 4: [4, 24, 15] },
+    fixedByPrerelease: { base: "5.0.0", tag: "beta", below: 32 },
     advisory:
-      "CVE-2026-73419: OAuth state/nonce/PKCE check cookies are not bound to the issuing provider, enabling provider confusion and unauthorized account linking. Fixed in 4.24.15 (v4) and 5.0.0-beta.32 (v5 beta — not detectable here, since the prerelease tag is not comparable; verify v5 betas by hand).",
+      "CRITICAL fail-open in Auth.js v5 — CVE-2026-73421 / GHSA-8fpg-xm3f-6cx3 (CVSS 9.1): from 5.0.0-beta.0 until 5.0.0-beta.32, an app that gates access by checking only that the `auth()` object exists can FAIL OPEN when Auth.js hits a server configuration error (a provider missing issuer/authorization endpoints, or an unset AUTH_SECRET) — the object is populated with an error instead of being null, so routes protected only by session existence silently grant access to every visitor. Also CVE-2026-73419: OAuth state/nonce/PKCE check cookies are not bound to the issuing provider, enabling provider confusion and unauthorized account linking. Fixed in 4.24.15 (v4) and 5.0.0-beta.32 (v5).",
   },
   { name: "lodash", fixedBelow: [4, 17, 21], advisory: "Prototype pollution / ReDoS fixed in lodash 4.17.21." },
   { name: "axios", fixedBelow: [1, 8, 0], advisory: "SSRF / credential leak advisories fixed in axios 1.8.0." },
@@ -380,6 +402,30 @@ export const generalRules: Rule[] = [
       for (const adv of KNOWN_VULN_DEPS) {
         const raw = deps[adv.name];
         if (!raw || typeof raw !== "string") continue;
+
+        // Prerelease line first — the numeric compare below cannot see the tag.
+        const pre = adv.fixedByPrerelease;
+        if (pre) {
+          const base = pre.base.replace(/\./g, "\\.");
+          const pm = new RegExp(`^[\\^~>=<\\s]*${base}-${pre.tag}\\.(\\d+)`).exec(
+            raw.trim()
+          );
+          if (pm) {
+            if (Number(pm[1]) < pre.below) {
+              const idx = f.content.indexOf(`"${adv.name}"`);
+              out.push({
+                line: idx >= 0 ? lineAt(f.content, idx) : 1,
+                column: idx >= 0 ? columnAt(f.content, idx) : undefined,
+                snippet:
+                  idx >= 0 ? snippetAt(f.content, idx) : `"${adv.name}": "${raw}"`,
+                message: `${adv.name}@${raw}: ${adv.advisory} (upgrade to >= ${pre.base}-${pre.tag}.${pre.below}).`,
+              });
+            }
+            // A recognised prerelease is fully decided here, either way.
+            continue;
+          }
+        }
+
         const ver = parseVersion(raw);
         if (!ver) continue;
         const target = depFixTarget(ver, adv);
