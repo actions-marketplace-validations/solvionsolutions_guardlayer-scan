@@ -9,6 +9,32 @@ import {
 } from "../helpers";
 
 const isJsLike = (f: ScanFile) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(f.path);
+const isNextConfig = (f: ScanFile) =>
+  /(^|[\/\\])next\.config\.(js|cjs|mjs|ts|mts)$/.test(f.path);
+
+// The image optimizer is OFF — nothing is fetched server-side, so remote-image
+// settings cannot be abused. Only a literal `true` / `"custom"` counts; an
+// env-driven toggle is not proof it is off in production.
+const IMAGE_OPTIMIZER_OFF =
+  /\bunoptimized\s*:\s*true\b|\bloader\s*:\s*(['"`])custom\1/g;
+
+// Is the match at `idx` commented out? Deliberately NOT stripJsComments: image
+// globs ('//**/**', '/**', '**/x') look like /* ... */ to a regex stripper, which
+// would erase the very pattern we match. Instead: a `//` (not part of `://`)
+// earlier on the same line, or a line that opens/continues a block comment.
+function isCommentedOut(content: string, idx: number): boolean {
+  const lineStart = content.lastIndexOf("\n", idx - 1) + 1;
+  const before = content.slice(lineStart, idx);
+  if (/(^|[^:])\/\//.test(before)) return true;
+  return /^\s*(\/\*|\*)/.test(before);
+}
+
+const imageOptimizerOff = (content: string) => {
+  for (const m of content.matchAll(IMAGE_OPTIMIZER_OFF)) {
+    if (!isCommentedOut(content, m.index ?? 0)) return true;
+  }
+  return false;
+};
 
 // Recognised authentication / authorization shapes. Deliberately broad to
 // avoid the worst-case outcome: a CRITICAL "no auth" finding on code that IS
@@ -282,6 +308,76 @@ export const nextjsRules: Rule[] = [
       const hasMatcher = /config\s*=\s*\{[\s\S]*?\bmatcher\b/.test(f.content);
       if (doesAuth && !hasMatcher) {
         return [{ line: 1, snippet: snippetAt(f.content, 0) }];
+      }
+      return [];
+    },
+  },
+
+  // ──────────────────────────────────────────────────────────────────────
+  // WARNING — image optimizer allow-lists EVERY remote host ('**')
+  // ──────────────────────────────────────────────────────────────────────
+  {
+    id: "nextjs/image-remote-wildcard-host",
+    title: "Image optimizer allows any remote host",
+    severity: "warning",
+    category: "nextjs",
+    cwe: "CWE-918",
+    message:
+      "images.remotePatterns allows ANY host ('**'). /_next/image is a server-side fetcher: with a match-everything allow-list, anyone can make your deployment fetch and re-encode images from any URL (bandwidth and compute you pay for), and every URL counts as allow-listed — the precondition for image-optimizer SSRF bugs such as CVE-2026-94483 (Sept 2026, High). On Next.js 16, private IPs stay blocked unless dangerouslyAllowLocalIP is set; this flags the over-broad allow-list in your config, not a confirmed exploit.",
+    recommendation:
+      "List the exact hosts you serve images from (e.g. { protocol: 'https', hostname: '<ref>.supabase.co', pathname: '/storage/v1/object/public/**' }). Scoped wildcards like '**.example.com' are fine. If you truly must render arbitrary user-supplied image URLs, set unoptimized on those <Image>s instead of opening the optimizer to the whole internet.",
+    reference:
+      "https://nextjs.org/docs/app/api-reference/components/image#remotepatterns",
+    appliesTo: isNextConfig,
+    scan: (f) => {
+      const src = f.content;
+      if (!/remotePatterns/.test(src) || imageOptimizerOff(src)) return [];
+      const out: RuleMatch[] = [];
+      // Exactly '**' as the WHOLE hostname, or the URL-object form
+      // new URL('https://**...'). A scoped '**.example.com' never matches (the
+      // closing quote must follow '**' directly), and a bare '*' is deliberately
+      // excluded — it matches a single label, not every host.
+      const re =
+        /\bhostname\s*:\s*(['"`])\*\*\1|\bnew\s+URL\(\s*(['"`])https?:\/\/\*\*(?=[\/'"`:])/g;
+      let m: RegExpExecArray | null;
+      let guard = 0;
+      while ((m = re.exec(src)) !== null) {
+        if (++guard > 200) break;
+        if (isCommentedOut(src, m.index)) continue;
+        out.push({
+          line: lineAt(src, m.index),
+          snippet: snippetAt(src, m.index),
+          message:
+            "images.remotePatterns allows any host ('**') — the image optimizer will fetch from anywhere.",
+        });
+      }
+      return out;
+    },
+  },
+
+  // ──────────────────────────────────────────────────────────────────────
+  // WARNING — image optimizer explicitly allowed to fetch private IPs
+  // ──────────────────────────────────────────────────────────────────────
+  {
+    id: "nextjs/image-allow-local-ip",
+    title: "Image optimizer allowed to fetch private IPs",
+    severity: "warning",
+    category: "nextjs",
+    cwe: "CWE-918",
+    message:
+      "images.dangerouslyAllowLocalIP is true, so the server-side image optimizer may fetch from private/local IP addresses. Next.js warns this could allow malicious users to access content on your internal network. It is meant only for self-hosting on a private network.",
+    recommendation:
+      "Remove dangerouslyAllowLocalIP (it defaults to false). If you self-host and genuinely need internal images, keep remotePatterns pinned to the exact internal hosts and paths — never combine this with a '**' hostname.",
+    reference:
+      "https://nextjs.org/docs/app/api-reference/components/image#dangerouslyallowlocalip",
+    appliesTo: isNextConfig,
+    scan: (f) => {
+      const src = f.content;
+      if (imageOptimizerOff(src)) return [];
+      for (const m of src.matchAll(/\bdangerouslyAllowLocalIP\s*:\s*true\b/g)) {
+        const idx = m.index ?? 0;
+        if (isCommentedOut(src, idx)) continue;
+        return [{ line: lineAt(src, idx), snippet: snippetAt(src, idx) }];
       }
       return [];
     },

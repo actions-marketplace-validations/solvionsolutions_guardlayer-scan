@@ -106,9 +106,18 @@ const KNOWN_VULN_DEPS: {
     // 16.3.3 -> 16.3.6. Next.js 15.x is explicitly NOT affected by this RCE
     // (15.5.26 is hardening only), so the 15 floor deliberately STAYS at 15.5.24
     // — raising it would flag 15.5.24/.25 for a bug they do not have.
-    fixedByMajor: { 15: [15, 5, 24], 16: [16, 3, 6] },
+    //
+    // 2026-09-30 September security release: 7 advisories (1 high, 5 medium,
+    // 1 low), patched in 16.3.8 / 15.5.27. Unlike the next/og RCE, 15.x IS
+    // affected this time (both SSG/ISR cache-poisoning advisories list
+    // >=15.0.0), so BOTH floors move. NOTE: 16.3.7 (2026-09-29) is on npm but
+    // is NOT the patched release — the floor is 16.3.8, so 16.3.7 must fire.
+    // The repo GHSA records carry placeholder ranges ("16.3.?"), so these floors
+    // come from the release post, not the range strings. Vercel postponed one
+    // further critical + one high fix pending upstream dependencies.
+    fixedByMajor: { 15: [15, 5, 27], 16: [16, 3, 8] },
     advisory:
-      "CRITICAL RCE in the Node.js ImageResponse from next/og — CVE-2026-94545 / GHSA-vcvr-r3jv-pc5j (CVSS 9.5), via improper SVG escaping in upstream Satori; affects >=16.2.0 <16.3.6 (the Edge implementation is unaffected). On top of the August 2026 pair of critical unauthenticated RCEs (GHSA-2xp9-vwfh-vxw4 AVIF Image Optimization, CVE-2026-75604 Windows-hosted servers), the July 2026 set (CVE-2026-64641 through CVE-2026-64649) and the earlier CVE-2025-29927 middleware bypass. Patch to 16.3.6+ (16.x) or 15.5.24+ (15.x); 14.x and older have no fix branch. Note a further nine-vulnerability release (16.3.7 / 15.5.27) is scheduled for 2026-09-30.",
+      "September 2026 security release (2026-09-30): HIGH SSRF in Image Optimization via an attacker-controlled, allow-listed remote URL — CVE-2026-94483 / GHSA-cjq9-62q9-8jv4 (16.x; not affected if no images.remotePatterns) — plus five medium issues (SSG/ISR cache poisoning CVE-2026-94543 and CVE-2026-94484, which also affect 15.x; metadata-image dynamicParams bypass CVE-2026-94485; two 'use cache' leaks incl. Draft Mode content CVE-2026-94544) and a low-severity next dev MCP endpoint disclosure (CVE-2026-94486). This is on top of the 2026-09-22 CRITICAL RCE in next/og ImageResponse (CVE-2026-94545, CVSS 9.5, 16.x only), the August 2026 critical unauthenticated RCEs (GHSA-2xp9-vwfh-vxw4, CVE-2026-75604), the July 2026 set (CVE-2026-64641 through CVE-2026-64649) and the earlier CVE-2025-29927 middleware bypass. Patch to 16.3.8+ (16.x) or 15.5.27+ (15.x) — note 16.3.7 is NOT the patched release; 14.x and older have no fix branch. Vercel has postponed one further critical and one high fix pending upstream dependencies, so expect another release.",
   },
   {
     // The upstream package behind CVE-2026-94545. Next.js bundles its own copy
