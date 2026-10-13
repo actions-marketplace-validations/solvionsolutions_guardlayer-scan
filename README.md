@@ -26,10 +26,10 @@ That's it. Findings appear as annotations on the exact file and line, plus a sum
 
 ## What it checks
 
-33 checks across six areas:
+36 checks across six areas:
 
 - **Supabase RLS** — tables with RLS disabled or missing, `USING (true)` policies, policies not scoped to the user, policies keyed off user-editable `user_metadata`, tables `GRANT`ed to `anon` without RLS, `SECURITY DEFINER` functions with an unpinned `search_path`.
-- **Exposed secrets** — service-role keys and `sb_secret_` keys leaked through `NEXT_PUBLIC_`, hardcoded provider keys, connection strings. (A publishable `sb_publishable_` / anon key is *not* flagged — it's public by design.)
+- **Exposed secrets** — service-role keys and `sb_secret_` keys leaked through `NEXT_PUBLIC_`, hardcoded service_role JWTs, hardcoded provider keys. (A publishable `sb_publishable_` / anon key is *not* flagged — it's public by design.)
 - **Next.js app layer** — Server Actions and API routes with no auth check, wildcard CORS, open redirects built from request input, missing middleware matchers, `getSession()` trusted in server code.
 - **Dependencies** — known-vulnerable versions of `next` and the React Server Components packages `react-server-dom-*` (per release branch), `@supabase/auth-js`, `next-auth` and `@auth/core`, plus deprecated packages like `@supabase/auth-helpers-*`.
 - **Webhooks** — Stripe/webhook handlers that never verify the signature.
