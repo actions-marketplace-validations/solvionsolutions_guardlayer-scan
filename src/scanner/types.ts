@@ -27,6 +27,8 @@ export interface RuleMatch {
   /** Optional per-match overrides of the rule defaults. */
   message?: string;
   recommendation?: string;
+  /** Resolved in toFinding only; everything downstream reads finding.severity. */
+  severity?: Severity;
 }
 
 /** A scanning rule. */
