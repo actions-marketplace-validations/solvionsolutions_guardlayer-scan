@@ -656,7 +656,15 @@ const PUT_WRITE_ACTION: Record<string, string> = {
 // is not security_invoker, and a materialized view or foreign table (neither
 // can ever be protected) are reported. An object the file never creates is
 // left to the CREATE-site rules (rls-missing-on-table, rls-explicitly-
-// disabled, policy-using-true): its RLS state is unknowable per-file.
+// disabled, policy-using-true): its RLS state is unknowable per-file. RLS
+// counts however rls-missing-on-table credits it (direct ALTER, a later
+// action of a multi-action ALTER, a DO-block FOREACH … ARRAY loop). A grant
+// whose Data-API privileges the file later REVOKEs from the same role is not
+// reported (a REVOKE in a CREATE FUNCTION body does not count: it runs only
+// if called), and a GRANT that is prose in a literal (COMMENT ON … IS '…')
+// is not a GRANT. A table finding is critical unless the object became a
+// table only after the GRANT, or the file enables RLS on run-time-built
+// names it cannot resolve (pg_tables loops): then it stays a warning.
 // Strictly per-file. Every regex is a bounded single-class run or the same
 // [schema.]name shape as alterRe; the GRANT loop resumes after each
 // statement and every per-GRANT step is bounded, so total work stays linear
@@ -687,7 +695,16 @@ type GtaKind = "table" | "view" | "matview" | "foreign";
 type GtaEvent =
   | { pos: number; key: string; type: "create"; kind: GtaKind; invoker: boolean }
   | { pos: number; key: string; type: "rls" | "invoker"; on: boolean };
-type GtaState = { kind?: GtaKind; rls: boolean; inv: boolean; firstCreate: number };
+// firstCreate: earliest CREATE of any kind. firstTable: earliest CREATE of a
+// plain table (a view dropped and recreated as a table keeps the view's
+// firstCreate, but was not a table before then).
+type GtaState = {
+  kind?: GtaKind;
+  rls: boolean;
+  inv: boolean;
+  firstCreate: number;
+  firstTable: number;
+};
 
 // Only a table can be protected by RLS and only a view by security_invoker.
 // Materialized views and foreign tables support neither.
@@ -779,6 +796,12 @@ function gtaObjectState(src: string): Map<string, GtaState> {
       });
     }
   );
+  // The same RLS enables rls-missing-on-table credits: a later action of a
+  // multi-action ALTER TABLE, and a DO-block FOREACH … ARRAY['a', 'b'] loop.
+  for (const t of rlsMultiActionToggles(src))
+    events.push({ pos: t.pos, key: t.key, type: "rls", on: t.on });
+  for (const e of rlsDynLoopEnables(src))
+    events.push({ pos: e.pos, key: e.key, type: "rls", on: true });
 
   each(
     new RegExp(
@@ -806,10 +829,15 @@ function gtaObjectState(src: string): Map<string, GtaState> {
   const state = new Map<string, GtaState>();
   for (const e of events) {
     let st = state.get(e.key);
-    if (!st) state.set(e.key, (st = { rls: false, inv: false, firstCreate: Infinity }));
+    if (!st)
+      state.set(
+        e.key,
+        (st = { rls: false, inv: false, firstCreate: Infinity, firstTable: Infinity })
+      );
     if (e.type === "create") {
       st.kind = e.kind;
       st.firstCreate = Math.min(st.firstCreate, e.pos);
+      if (e.kind === "table") st.firstTable = Math.min(st.firstTable, e.pos);
       // CREATE OR REPLACE VIEW replaces the whole reloptions list, so a
       // re-create without WITH resets security_invoker to false.
       if (e.kind === "view") st.inv = e.invoker;
@@ -820,6 +848,264 @@ function gtaObjectState(src: string): Map<string, GtaState> {
     }
   }
   return state;
+}
+
+/** Data-API privileges of a GRANT / REVOKE privilege list as bits (SELECT 1,
+ *  INSERT 2, UPDATE 4, DELETE 8; ALL is all four). Column lists removed first. */
+function gtaPrivMask(privs: string): number {
+  if (/\bALL\b/i.test(privs)) return 15;
+  let mask = 0;
+  if (/\bSELECT\b/i.test(privs)) mask |= 1;
+  if (/\bINSERT\b/i.test(privs)) mask |= 2;
+  if (/\bUPDATE\b/i.test(privs)) mask |= 4;
+  if (/\bDELETE\b/i.test(privs)) mask |= 8;
+  return mask;
+}
+
+/**
+ * Every '…' literal and $tag$ body of a file, in source order (so properly
+ * nested: a literal inside a DO block comes after it, with `parent` set), and
+ * what runs it, worked out on demand by gtaRegionCls:
+ *  - "exec": a DO block, or a literal / body handed to EXECUTE,
+ *    cron.schedule or dblink_exec: SQL that runs.
+ *  - "func": a CREATE FUNCTION / PROCEDURE body (… AS '…' / AS $$…$$), which
+ *    runs only if someone calls the function.
+ *  - "prose": anything else (COMMENT ON … IS '…', a RAISE message).
+ * One left-to-right pass over the RAW file (linear): comments are skipped
+ * (an apostrophe in one is not a quote), "…" identifiers are stepped over,
+ * '' and E'\'' escapes stay inside their literal, and each dollar body is
+ * lexed again for its own literals (to depth 4; Postgres ends a body at the
+ * first matching tag, so nothing inside can run past it). Fails loud: an
+ * unterminated literal or comment ends lexing of its region, so whatever
+ * follows counts as live SQL.
+ */
+type GtaRegion = {
+  open: number;
+  close: number;
+  lit: boolean;
+  parent: number;
+  cls?: "exec" | "func" | "prose";
+};
+
+function gtaRegions(content: string): GtaRegion[] {
+  const out: GtaRegion[] = [];
+  const ident = /[A-Za-z0-9_$]/;
+  let dollarMisses = 0;
+  const lex = (from: number, to: number, parent: number, depth: number) => {
+    const re = /['"$]|--|\/\*/g;
+    re.lastIndex = from;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(content)) !== null && m.index < to) {
+      const i = m.index;
+      if (m[0] === "--") {
+        const j = content.indexOf("\n", i + 2);
+        if (j === -1 || j >= to) return;
+        re.lastIndex = j + 1;
+      } else if (m[0] === "/*") {
+        const j = content.indexOf("*/", i + 2);
+        if (j === -1 || j + 2 > to) return;
+        re.lastIndex = j + 2;
+      } else if (m[0] === '"') {
+        const j = content.indexOf('"', i + 1);
+        if (j === -1 || j >= to) return;
+        re.lastIndex = j + 1;
+      } else if (m[0] === "'") {
+        // E'…' takes backslash escapes; a standard literal only ''.
+        const esc = /[eE]/.test(content[i - 1] ?? "") && !ident.test(content[i - 2] ?? "");
+        let j = content.indexOf("'", i + 1);
+        for (;;) {
+          if (j === -1 || j >= to) return;
+          let bs = 0;
+          if (esc) for (let b = j - 1; b > i && content[b] === "\\"; b--) bs++;
+          if (bs % 2 === 1) j = content.indexOf("'", j + 1);
+          else if (content[j + 1] === "'") j = content.indexOf("'", j + 2);
+          else break;
+        }
+        out.push({ open: i, close: j + 1, lit: true, parent });
+        re.lastIndex = j + 1;
+      } else {
+        // `$1` positional params and foo$bar identifiers are not tags.
+        if (ident.test(content[i - 1] ?? "") || dollarMisses >= 64) continue;
+        const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]{0,62})?\$/.exec(content.slice(i, i + 66));
+        if (!tag) continue;
+        const close = content.indexOf(tag[0], i + tag[0].length);
+        if (close === -1 || close + tag[0].length > to) {
+          dollarMisses++;
+          continue;
+        }
+        const self = out.length;
+        out.push({ open: i, close: close + tag[0].length, lit: false, parent });
+        if (depth < 4) lex(i + tag[0].length, close, self, depth + 1);
+        re.lastIndex = close + tag[0].length;
+      }
+    }
+  };
+  lex(0, content.length, -1, 0);
+  return out;
+}
+
+/** What runs region r (see gtaRegions), from what leads up to it in `src`
+ *  (comments blanked). Memoized: only regions a GRANT / REVOKE sits in are
+ *  ever classified. */
+function gtaRegionCls(regions: GtaRegion[], r: number, src: string): GtaRegion["cls"] {
+  const g = regions[r];
+  if (g.cls) return g.cls;
+  const lead = src.slice(Math.max(0, g.open - 200), g.open);
+  if (/\bDO\s*(?:LANGUAGE\s+'?[a-z0-9_]+'?\s*)?$/i.test(lead)) g.cls = "exec";
+  else if (/\bAS\s*$/i.test(lead)) g.cls = "func";
+  else
+    g.cls = /\b(?:EXECUTE|cron\s*\.\s*schedule|dblink_exec)\b/i.test(
+      lead.slice(lead.lastIndexOf(";") + 1)
+    )
+      ? "exec"
+      : "prose";
+  return g.cls;
+}
+
+/** Innermost region containing idx, or -1: the last region opened before
+ *  idx, or the nearest of its ancestors that has not closed by then. */
+function gtaRegionAt(regions: GtaRegion[], idx: number): number {
+  let lo = 0;
+  let hi = regions.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (regions[mid].open < idx) lo = mid + 1;
+    else hi = mid;
+  }
+  let r = lo - 1;
+  while (r !== -1 && regions[r].close <= idx) r = regions[r].parent;
+  return r;
+}
+
+/** True when the GRANT at `idx` is prose inside an ordinary '…' literal
+ *  (COMMENT ON … IS 'never grant select on t to anon; it holds PII', a RAISE
+ *  message), not SQL that runs. A literal handed to EXECUTE, cron.schedule or
+ *  dblink_exec, or a single-quoted function body, still counts. */
+function gtaInProse(regions: GtaRegion[], src: string, idx: number): boolean {
+  const r = gtaRegionAt(regions, idx);
+  return r !== -1 && regions[r].lit && gtaRegionCls(regions, r, src) === "prose";
+}
+
+/** True when the REVOKE at `idx` runs when the migration does: top-level SQL,
+ *  or every body / literal around it is a DO block or EXECUTE'd. A REVOKE in a
+ *  CREATE FUNCTION / PROCEDURE body only runs if someone calls it, and one in
+ *  prose never does; neither takes a grant back. */
+function gtaRuns(regions: GtaRegion[], src: string, idx: number): boolean {
+  for (let r = gtaRegionAt(regions, idx); r !== -1; r = regions[r].parent)
+    if (gtaRegionCls(regions, r, src) !== "exec") return false;
+  return true;
+}
+
+// REVOKEs from anon / PUBLIC, per role ("all" = ON ALL TABLES IN SCHEMA
+// public) or per role + object: positions ascending, and suffix[i] = every
+// privilege revoked at pos[i] or later.
+type GtaRevokeList = { pos: number[]; suffix: number[] };
+type GtaRevokes = {
+  all: Map<string, GtaRevokeList>;
+  obj: Map<string, GtaRevokeList>;
+  objKeys: Set<string>;
+};
+
+/**
+ * Every REVOKE of Data-API privileges from anon or PUBLIC on a public object
+ * or ON ALL TABLES IN SCHEMA public. REVOKE GRANT OPTION FOR (the privilege
+ * stays) and column revokes (the table-level grant stays) take nothing away,
+ * and a REVOKE … FROM PUBLIC does not touch a grant made to anon itself (nor
+ * the reverse). Only a REVOKE that runs with the migration counts (gtaRuns):
+ * not one in a function body or in prose. Statement by statement like the
+ * GRANT loop; capped at 100 objects so the per-GRANT check stays cheap (past
+ * the cap, a REVOKE is ignored and the grant still fires).
+ */
+function gtaRevokes(src: string, regions: GtaRegion[]): GtaRevokes {
+  const all = new Map<string, GtaRevokeList>();
+  const obj = new Map<string, GtaRevokeList>();
+  const objKeys = new Set<string>();
+  const add = (map: Map<string, GtaRevokeList>, k: string, pos: number, mask: number) => {
+    let l = map.get(k);
+    if (!l) map.set(k, (l = { pos: [], suffix: [] }));
+    l.pos.push(pos);
+    l.suffix.push(mask);
+  };
+  const re = /\bREVOKE\b/gi;
+  let m: RegExpExecArray | null;
+  let guard = 0;
+  while ((m = re.exec(src)) !== null) {
+    if (++guard > 20000 || objKeys.size >= 100) break;
+    const idx = m.index;
+    // Bounded exactly as in the GRANT loop of grant-to-anon.
+    const end = sqlStatementEnd(src.slice(0, idx + 4000), idx, 4000);
+    if (!/\$[A-Za-z0-9_]*\$/.test(src.slice(idx, end))) re.lastIndex = Math.max(re.lastIndex, end);
+    if (!gtaRuns(regions, src, idx)) continue;
+    const stmt = src.slice(idx + 6, end);
+    if (/^\s*GRANT\s+OPTION\s+FOR\b/i.test(stmt)) continue;
+    const on = /\sON\s/i.exec(stmt);
+    if (!on) continue;
+    const mask = gtaPrivMask(
+      stmt.slice(0, on.index).replace(/\b[a-z]+(?:\s+PRIVILEGES)?\s*\([^()]*\)/gi, " ")
+    );
+    if (!mask) continue;
+    const rest = " " + stmt.slice(on.index + on[0].length);
+    const from = /\sFROM\s/i.exec(rest);
+    if (!from) continue;
+    const objects = rest.slice(0, from.index).trim().replace(/^TABLE\s+/i, "");
+    let roles = rest.slice(from.index + from[0].length);
+    const cut = /\b(?:GRANTED\s+BY|CASCADE|RESTRICT)\b/i.exec(roles);
+    if (cut) roles = roles.slice(0, cut.index);
+    const who = new Set(
+      roles
+        .split(",")
+        .map((r) => unquote(r.trim().replace(/^GROUP\s+/i, "")))
+        .filter((r) => r === "anon" || r === "public")
+    );
+    if (who.size === 0) continue;
+    const allT = GTA_ALL_TABLES.exec(objects);
+    if (allT) {
+      if (allT[1].split(",").some((s) => unquote(s.trim()) === "public"))
+        for (const r of who) add(all, r, idx, mask);
+      continue;
+    }
+    if (GTA_NON_TABLE.test(objects) || /[%|$']/.test(objects)) continue;
+    for (const o of objects.split(",")) {
+      const om = GTA_OBJECT_RE.exec(o);
+      if (!om) continue;
+      const key = gtaKey(om[1], om[2]);
+      objKeys.add(key);
+      for (const r of who) add(obj, `${r}\u0000${key}`, idx, mask);
+    }
+  }
+  for (const l of [...all.values(), ...obj.values()])
+    for (let i = l.pos.length - 2; i >= 0; i--) l.suffix[i] |= l.suffix[i + 1];
+  return { all, obj, objKeys };
+}
+
+/** Privileges the REVOKEs in `l` take away after `idx` (binary search). */
+function gtaAfter(l: GtaRevokeList | undefined, idx: number): number {
+  if (!l) return 0;
+  let lo = 0;
+  let hi = l.pos.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (l.pos[mid] <= idx) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < l.pos.length ? l.suffix[lo] : 0;
+}
+
+/** True when everything the GRANT at `idx` gives each of `roles` (anon /
+ *  public) through the Data API on `key` is revoked again later in the file,
+ *  per object or ON ALL TABLES IN SCHEMA public. */
+function gtaRevokedLater(
+  rv: GtaRevokes,
+  roles: string[],
+  mask: number,
+  key: string,
+  idx: number
+): boolean {
+  return roles.every(
+    (r) =>
+      (mask & ~(gtaAfter(rv.all.get(r), idx) | gtaAfter(rv.obj.get(`${r}\u0000${key}`), idx))) ===
+      0
+  );
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -861,6 +1147,104 @@ function lastMatchOf(re: RegExp, text: string): RegExpExecArray | null {
     if (m[0].length === 0) re.lastIndex++;
   }
   return last;
+}
+
+// The two helpers below are shared by rls-missing-on-table and grant-to-anon,
+// so both rules credit the same RLS enables. Keys are schema.table, lowercase.
+
+/**
+ * RLS enabled (or disabled) as a later action of a multi-action ALTER TABLE:
+ * ALTER TABLE t ADD COLUMN bio text, ENABLE ROW LEVEL SECURITY. The direct
+ * form (ALTER TABLE t ENABLE …) is matched by each rule's own regex. Anchored
+ * on the comma-preceded action (rare), then the last ALTER TABLE <name> in the
+ * same statement is found in a fixed 2,000-character lookback, so the work is
+ * capped (1,000 anchors × 2,000 characters).
+ */
+function rlsMultiActionToggles(src: string): { pos: number; key: string; on: boolean }[] {
+  const out: { pos: number; key: string; on: boolean }[] = [];
+  const re = /,\s*(ENABLE|DISABLE)\s+ROW\s+LEVEL\s+SECURITY\b/gi;
+  const alterRe = new RegExp(
+    String.raw`\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?` + GTA_QNAME + String.raw`\s`,
+    "gi"
+  );
+  let m: RegExpExecArray | null;
+  let guard = 0;
+  while ((m = re.exec(src)) !== null) {
+    if (++guard > 1000) break;
+    const win = src.slice(Math.max(0, m.index - 2000), m.index);
+    // Same statement only: nothing before the last ";".
+    const stmt = win.slice(win.lastIndexOf(";") + 1);
+    const a = lastMatchOf(alterRe, stmt);
+    if (!a) continue;
+    out.push({ pos: m.index, key: gtaKey(a[1], a[2]), on: /^ENABLE$/i.test(m[1]) });
+  }
+  return out;
+}
+
+/**
+ * Dynamic-loop enables: an anonymous DO block that runs
+ *   FOREACH t IN ARRAY ARRAY['a', 'b'] LOOP
+ *     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+ * credits every literal in the array. Each condition keeps a real gap firing:
+ * the array must feed a LOOP that reaches the ALTER, sit in the SAME dollar
+ * body (not a GRANT loop in an earlier DO block), and that body must be a DO
+ * block — a loop inside CREATE FUNCTION only runs if someone calls the
+ * function. `pos` is the ALTER inside the loop.
+ */
+function rlsDynLoopEnables(src: string): { pos: number; key: string }[] {
+  const out: { pos: number; key: string }[] = [];
+  const dynAlterRe =
+    /ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:([a-z0-9_"]{1,130})\s{0,8}\.\s{0,8})?"?%[Is]"?\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY/gi;
+  let m: RegExpExecArray | null;
+  let guard = 0;
+  while ((m = dynAlterRe.exec(src)) !== null) {
+    if (++guard > 50) break;
+    const schema = m[1] ? unquote(m[1]) : "public";
+    const winStart = Math.max(0, m.index - 4000);
+    const win = src.slice(winStart, m.index);
+    const arr = lastMatchOf(/\bARRAY\s{0,8}\[/gi, win);
+    if (!arr) continue;
+    const listStart = arr.index + arr[0].length;
+    const close = win.indexOf("]", listStart);
+    if (close === -1) continue;
+    if (!/\bLOOP\b/i.test(win.slice(close + 1))) continue;
+    if (RLS_DOLLAR_TAG.test(win.slice(arr.index))) continue;
+    const pre = src.slice(Math.max(0, winStart + arr.index - 3000), winStart + arr.index);
+    const tag = lastMatchOf(new RegExp(RLS_DOLLAR_TAG.source, "gi"), pre);
+    if (!tag) continue;
+    const beforeTag = pre.slice(Math.max(0, tag.index - 40), tag.index);
+    if (!/\bDO\s*(?:LANGUAGE\s+'?plpgsql'?\s*)?$/i.test(beforeTag)) continue;
+    const list = win.slice(listStart, Math.min(close, listStart + 4000));
+    const litRe = /'([a-z0-9_]{1,128})'/gi;
+    let lm: RegExpExecArray | null;
+    while ((lm = litRe.exec(list)) !== null)
+      out.push({ pos: m.index, key: `${schema}.${lm[1].toLowerCase()}` });
+  }
+  return out;
+}
+
+/**
+ * True when the file enables RLS on a table whose name is built at run time
+ * and rlsDynLoopEnables cannot resolve it to literal names: a FOR r IN SELECT
+ * … FROM pg_tables loop, a loop in a function, %I.%I, 'public.' || name.
+ * grant-to-anon keeps its finding a warning then, since that loop may well
+ * cover the granted table. The ALTER is the last ALTER TABLE in a fixed
+ * 200-character lookback from each ENABLE (at most 1,000), so work is capped.
+ */
+function rlsDynUnresolved(src: string): boolean {
+  const resolved = new Set(rlsDynLoopEnables(src).map((e) => e.pos));
+  const re = /ENABLE\s+ROW\s+LEVEL\s+SECURITY/gi;
+  let m: RegExpExecArray | null;
+  let guard = 0;
+  while ((m = re.exec(src)) !== null) {
+    if (++guard > 1000) break;
+    const from = Math.max(0, m.index - 200);
+    const a = lastMatchOf(/\bALTER\s+TABLE\b/gi, src.slice(from, m.index));
+    if (!a) continue;
+    if (!/%[Is]|\|\|/.test(src.slice(from + a.index + a[0].length, m.index))) continue;
+    if (!resolved.has(from + a.index)) return true;
+  }
+  return false;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2068,40 +2452,15 @@ export const supabaseRules: Rule[] = [
       while ((m = alterRe.exec(src)) !== null) {
         enabled.add(`${m[1] ? unquote(m[1]) : "public"}.${unquote(m[2])}`);
       }
+      // ... and as a later action of a multi-action ALTER TABLE
+      //     (ALTER TABLE t ADD COLUMN x int, ENABLE ROW LEVEL SECURITY).
+      for (const t of rlsMultiActionToggles(src)) if (t.on) enabled.add(t.key);
 
-      // 2. Dynamic-loop enables: an anonymous DO block that runs
-      //    FOREACH t IN ARRAY ARRAY['a', 'b'] LOOP
-      //      EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
-      //    credits every literal in the array. Each condition keeps a real
-      //    gap firing: the array must feed a LOOP that reaches the ALTER, sit
-      //    in the SAME dollar body (not a GRANT loop in an earlier DO block),
-      //    and that body must be a DO block — a loop inside CREATE FUNCTION
-      //    only runs if someone calls the function.
-      const dynAlterRe =
-        /ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:([a-z0-9_"]{1,130})\s{0,8}\.\s{0,8})?"?%[Is]"?\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY/gi;
+      // 2. Dynamic-loop enables (DO-block FOREACH … ARRAY['a', 'b'] LOOP …
+      //    EXECUTE format('ALTER TABLE public.%I ENABLE …')): see
+      //    rlsDynLoopEnables, shared with grant-to-anon.
+      for (const e of rlsDynLoopEnables(src)) enabled.add(e.key);
       let guard = 0;
-      while ((m = dynAlterRe.exec(src)) !== null) {
-        if (++guard > 50) break;
-        const schema = m[1] ? unquote(m[1]) : "public";
-        const winStart = Math.max(0, m.index - 4000);
-        const win = src.slice(winStart, m.index);
-        const arr = lastMatchOf(/\bARRAY\s{0,8}\[/gi, win);
-        if (!arr) continue;
-        const listStart = arr.index + arr[0].length;
-        const close = win.indexOf("]", listStart);
-        if (close === -1) continue;
-        if (!/\bLOOP\b/i.test(win.slice(close + 1))) continue;
-        if (RLS_DOLLAR_TAG.test(win.slice(arr.index))) continue;
-        const pre = src.slice(Math.max(0, winStart + arr.index - 3000), winStart + arr.index);
-        const tag = lastMatchOf(new RegExp(RLS_DOLLAR_TAG.source, "gi"), pre);
-        if (!tag) continue;
-        const beforeTag = pre.slice(Math.max(0, tag.index - 40), tag.index);
-        if (!/\bDO\s*(?:LANGUAGE\s+'?plpgsql'?\s*)?$/i.test(beforeTag)) continue;
-        const list = win.slice(listStart, Math.min(close, listStart + 4000));
-        const litRe = /'([a-z0-9_]{1,128})'/gi;
-        let lm: RegExpExecArray | null;
-        while ((lm = litRe.exec(list)) !== null) enabled.add(`${schema}.${lm[1].toLowerCase()}`);
-      }
 
       // 3. Static CREATEs. The IF NOT EXISTS lookahead stops the backtrack
       //    that reported a table named "if" for CREATE TABLE IF NOT EXISTS
@@ -2568,8 +2927,10 @@ export const supabaseRules: Rule[] = [
   },
 
   // ──────────────────────────────────────────────────────────────────────
-  // WARNING — public table / view explicitly GRANTed to the anon role
-  // with nothing in front of it (no RLS, no security_invoker)
+  // CRITICAL (table) / WARNING (view, matview, foreign table) — public
+  // object explicitly GRANTed to the anon role with nothing in front of it
+  // (no RLS, no security_invoker). A plain table the same file creates
+  // without RLS and grants to anon is the CVE-2025-48757 shape.
   // ──────────────────────────────────────────────────────────────────────
   {
     id: "supabase/grant-to-anon",
@@ -2615,16 +2976,57 @@ export const supabaseRules: Rule[] = [
       // GRANT: a sorted list of creation points answers that by binary
       // search, and the first five names are recomputed only when the count
       // changes (GRANT hits only move forward, so equal count = equal set).
-      const allCands: { name: string; firstCreate: number }[] = [];
+      // `table` is when the object first became a plain table without RLS
+      // (Infinity for views, matviews, foreign tables): an ON ALL TABLES
+      // grant after that exposes at least one table (critical); one that
+      // only reaches views / matviews / foreign tables stays a warning.
+      const allCands: { name: string; key: string; firstCreate: number; table: number }[] = [];
       for (const [k, st] of state) {
         if (!k.startsWith("public.")) continue;
         const name = k.slice("public.".length);
         if (st.kind === undefined || name.startsWith("_") || gtaProtected(st)) continue;
-        allCands.push({ name, firstCreate: st.firstCreate });
+        const table = st.kind === "table" ? st.firstTable : Infinity;
+        allCands.push({ name, key: k, firstCreate: st.firstCreate, table });
       }
       const createdAt = allCands.map((c) => c.firstCreate).sort((a, b) => a - b);
+      const tableAt = allCands
+        .filter((c) => c.table !== Infinity)
+        .map((c) => c.table)
+        .sort((a, b) => a - b);
+      /** How many of the sorted positions come before idx. */
+      const countBefore = (sorted: number[], idx: number) => {
+        let lo = 0;
+        let hi = sorted.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (sorted[mid] < idx) lo = mid + 1;
+          else hi = mid;
+        }
+        return lo;
+      };
       let allCount = 0;
       let allFirst: string[] = [];
+
+      // Literals and dollar bodies: is a GRANT prose, does a REVOKE run?
+      const regions = gtaRegions(f.content);
+      // A grant whose Data-API privileges are all revoked from the same
+      // role(s) later in the file leaves anon nothing to use.
+      const rv = gtaRevokes(src, regions);
+      // RLS enabled on run-time-built names the scanner cannot resolve: a
+      // table finding stays a warning, as that loop may cover it.
+      const dynRls = rlsDynUnresolved(src);
+      // Candidates a REVOKE names directly: the only ones an ON ALL TABLES
+      // grant can lose one by one (at most 100, the gtaRevokes cap). Their
+      // REVOKE lists are looked up once here, not once per GRANT.
+      const revokedCands = rv.objKeys.size
+        ? allCands
+            .filter((c) => rv.objKeys.has(c.key))
+            .map((c) => ({
+              c,
+              anon: rv.obj.get(`anon\u0000${c.key}`),
+              pub: rv.obj.get(`public\u0000${c.key}`),
+            }))
+        : [];
 
       // One GRANT statement at a time: the old regex ran on past the `;` of
       // a GRANT … TO authenticated into an unrelated "anon" further down.
@@ -2649,6 +3051,8 @@ export const supabaseRules: Rule[] = [
         // to anon' has a literal, resolvable target; dynamic ones drop below.
         if (!/\$[A-Za-z0-9_]*\$/.test(src.slice(idx, end)))
           gRe.lastIndex = Math.max(gRe.lastIndex, end);
+        // ... but not prose in an ordinary literal (COMMENT ON … IS '…').
+        if (gtaInProse(regions, src, idx)) continue;
 
         const stmt = src.slice(idx + 5, end);
         const on = /\sON\s/i.exec(stmt);
@@ -2680,6 +3084,8 @@ export const supabaseRules: Rule[] = [
             ? "PUBLIC (every role, including anon)"
             : null;
         if (!who) continue;
+        const privMask = gtaPrivMask(privs);
+        const grantees = roleList.filter((r) => r === "anon" || r === "public");
 
         const all = GTA_ALL_TABLES.exec(objects);
         if (all) {
@@ -2687,20 +3093,36 @@ export const supabaseRules: Rule[] = [
           if (!schemas.includes("public")) continue;
           // ON ALL TABLES only reaches relations that already exist, so a
           // table created after the GRANT is not exposed by it.
-          let lo = 0;
-          let hi = createdAt.length;
-          while (lo < hi) {
-            const mid = (lo + hi) >> 1;
-            if (createdAt[mid] < idx) lo = mid + 1;
-            else hi = mid;
-          }
-          const exposed = lo;
+          let exposed = countBefore(createdAt, idx);
+          // What each grantee keeps after a later REVOKE … ON ALL TABLES;
+          // nothing kept takes the whole grant back.
+          const needAnon = grantees.includes("anon")
+            ? privMask & ~gtaAfter(rv.all.get("anon"), idx)
+            : 0;
+          const needPub = grantees.includes("public")
+            ? privMask & ~gtaAfter(rv.all.get("public"), idx)
+            : 0;
+          if (needAnon === 0 && needPub === 0) exposed = 0;
+          let tables = exposed > 0 ? countBefore(tableAt, idx) : 0;
+          // A later per-object REVOKE takes back that object only.
+          let dropped: Set<string> | null = null;
           if (exposed > 0) {
-            if (exposed !== allCount) {
-              allCount = exposed;
+            for (const { c, anon, pub } of revokedCands) {
+              if (c.firstCreate >= idx) continue;
+              if ((needAnon & ~gtaAfter(anon, idx)) !== 0) continue;
+              if ((needPub & ~gtaAfter(pub, idx)) !== 0) continue;
+              (dropped ??= new Set()).add(c.name);
+              exposed--;
+              if (c.table < idx) tables--;
+            }
+          }
+          if (exposed > 0) {
+            // Equal count = equal set only when nothing was dropped.
+            if (dropped || exposed !== allCount) {
+              allCount = dropped ? -1 : exposed;
               allFirst = [];
               for (const c of allCands) {
-                if (c.firstCreate >= idx) continue;
+                if (c.firstCreate >= idx || dropped?.has(c.name)) continue;
                 allFirst.push(c.name);
                 if (allFirst.length === 5) break;
               }
@@ -2709,6 +3131,7 @@ export const supabaseRules: Rule[] = [
             out.push({
               ...at(idx),
               message: `GRANT ... ON ALL TABLES IN SCHEMA public gives ${who} access to ${allFirst.join(", ")}${more > 0 ? ` and ${more} more` : ""}, which this file creates without RLS (or as views without security_invoker). Anyone with the public anon key can use these privileges on every row.`,
+              ...(tables > 0 && !dynRls ? { severity: "critical" as Severity } : {}),
             });
           }
           // ALTER DEFAULT PRIVILEGES … ON TABLES is NOT handled here; the
@@ -2736,17 +3159,29 @@ export const supabaseRules: Rule[] = [
           const st = state.get(`${schema}.${name}`);
           if (!st || st.kind === undefined) continue;
           if (gtaProtected(st)) continue;
+          if (gtaRevokedLater(rv, grantees, privMask, `${schema}.${name}`, idx)) continue;
           if (reported.has(name)) continue;
           reported.add(name);
           const message =
             st.kind === "table"
-              ? `Table "${name}" is created in this file without RLS (or has RLS disabled again) and is granted to ${who}. Anyone with the public anon key can use these privileges on every row.`
+              ? `Table "${name}" is created in this file without RLS (or has RLS disabled again) and is granted to ${who}. Anyone with the public anon key can use these privileges on every row. The scanner reads one file at a time: if a later migration enables RLS on it, this is the state between the two migrations.`
               : st.kind === "view"
                 ? `View "${name}" is granted to ${who} but is not security_invoker at its last definition in this file, so it runs with its owner's privileges and bypasses RLS on the tables it reads. Recreate it WITH (security_invoker = true), and repeat the WITH clause on every CREATE OR REPLACE VIEW, unless every row and column it returns is meant to be public.`
                 : st.kind === "matview"
                   ? `Materialized view "${name}" is granted to ${who}. Materialized views cannot have RLS or security_invoker, so every row they store is readable by anyone with the anon key. Revoke the grant or move the view out of the exposed schema unless all of its data is meant to be public.`
                   : `Foreign table "${name}" is granted to ${who}. Foreign tables do not support RLS, so the remote data is readable by anyone with the anon key. Move it to a schema that is not exposed through the Data API, or revoke the grant.`;
-          out.push({ ...at(idx), message });
+          // A plain table without RLS that this file itself grants to anon is
+          // the CVE-2025-48757 shape: critical. Views, materialized views and
+          // foreign tables keep the rule's default (warning), and so does an
+          // object that only became a table after the GRANT (a view dropped
+          // and recreated as one), as the ON ALL TABLES branch does.
+          out.push({
+            ...at(idx),
+            message,
+            ...(st.kind === "table" && st.firstTable < idx && !dynRls
+              ? { severity: "critical" as Severity }
+              : {}),
+          });
         }
       }
       return out;

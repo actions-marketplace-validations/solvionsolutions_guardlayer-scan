@@ -91,7 +91,9 @@ export interface ScanReport {
     engineVersion: string;
     durationMs: number;
     claudeEnriched: boolean;
-    /** True when the scan hit its wall-clock budget and results are partial. */
+    /** True when results are partial: the scan hit its wall-clock budget, or
+     *  (full-repo scans) GitHub truncated the tree, the file cap was hit, or a
+     *  file couldn't be read. */
     truncated?: boolean;
   };
 }

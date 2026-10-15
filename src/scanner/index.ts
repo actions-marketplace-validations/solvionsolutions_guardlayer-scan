@@ -100,7 +100,9 @@ export function runScan(files: ScanFile[], opts: RunScanOptions): ScanReport {
   const scannable = files.filter((f) => isScannable(f.path) && allowed(f.path));
   const findings: Finding[] = [];
   const perFileCount = new Map<string, number>();
-  const seen = new Set<string>();
+  // Finding id → its index in `findings`.
+  const seen = new Map<string, number>();
+  const sevRank: Record<Severity, number> = { critical: 0, warning: 1, info: 2 };
   let truncated = false;
 
   outer: for (const file of scannable) {
@@ -123,8 +125,18 @@ export function runScan(files: ScanFile[], opts: RunScanOptions): ScanReport {
       for (const m of matches) {
         if (m.line < 1) continue;
         const finding = toFinding(rule, file, m);
-        if (seen.has(finding.id)) continue;
-        seen.add(finding.id);
+        const prev = seen.get(finding.id);
+        if (prev !== undefined) {
+          // The id leaves out severity, so two matches a rule graded
+          // differently can collide (e.g. a view and a table in one GRANT).
+          // Keep the more severe one: which match came first must not decide
+          // whether the gate fails.
+          if (sevRank[finding.severity] < sevRank[findings[prev].severity]) {
+            findings[prev] = finding;
+          }
+          continue;
+        }
+        seen.set(finding.id, findings.length);
         findings.push(finding);
         perFileCount.set(file.path, (perFileCount.get(file.path) ?? 0) + 1);
       }
@@ -132,7 +144,6 @@ export function runScan(files: ScanFile[], opts: RunScanOptions): ScanReport {
   }
 
   // Order: severity desc, then file, then line.
-  const sevRank: Record<Severity, number> = { critical: 0, warning: 1, info: 2 };
   findings.sort(
     (a, b) =>
       sevRank[a.severity] - sevRank[b.severity] ||
