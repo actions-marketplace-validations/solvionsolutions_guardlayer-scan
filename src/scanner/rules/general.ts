@@ -209,9 +209,34 @@ const KNOWN_VULN_DEPS: {
     // The repo GHSA records carry placeholder ranges ("16.3.?"), so these floors
     // come from the release post, not the range strings. Vercel postponed one
     // further critical + one high fix pending upstream dependencies.
-    fixedByMajor: { 15: [15, 5, 27], 16: [16, 3, 8] },
+    //
+    // 2026-10-14 out-of-band release (the fixes postponed from 09-30): two
+    // CRITICAL unauthenticated RCEs (GHSA-2464-fhr4-w9xw / CVE-2026-96889 SVG
+    // Image Optimization via upstream sharp/librsvg; GHSA-673q-mjm6-r5xr
+    // `use cache` returning typed arrays) and one HIGH DoS (GHSA-p3m5-59mp-jv5r,
+    // Server Actions), patched in 16.4.1 (Active LTS) / 15.5.28 (Maintenance
+    // LTS). There is NO patched 16.3.x — Active LTS moved 16.3 -> 16.4 and every
+    // 16.x <= 16.4.0 is in range — so the 16 floor jumps 16.3.8 -> 16.4.1 and the
+    // whole 16.3 line (incl. the old 16.3.8 floor) fires. 15.x IS affected
+    // (GHSA-2464 lists >=10.0.0 <=15.5.27, GHSA-p3m5 >=13.0.0 <=15.5.27), so the
+    // 15 floor moves 15.5.27 -> 15.5.28. This time the repo GHSA ranges are
+    // concrete (no placeholders) and match the release post. 16.4.2 (2026-10-15)
+    // is a bugfix-only follow-up; the patched floor is 16.4.1.
+    fixedByMajor: { 15: [15, 5, 28], 16: [16, 4, 1] },
     advisory:
-      "September 2026 security release (2026-09-30): HIGH SSRF in Image Optimization via an attacker-controlled, allow-listed remote URL — CVE-2026-94483 / GHSA-cjq9-62q9-8jv4 (16.x; not affected if no images.remotePatterns) — plus five medium issues (SSG/ISR cache poisoning CVE-2026-94543 and CVE-2026-94484, which also affect 15.x; metadata-image dynamicParams bypass CVE-2026-94485; two 'use cache' leaks incl. Draft Mode content CVE-2026-94544) and a low-severity next dev MCP endpoint disclosure (CVE-2026-94486). This is on top of the 2026-09-22 CRITICAL RCE in next/og ImageResponse (CVE-2026-94545, CVSS 9.5, 16.x only), the August 2026 critical unauthenticated RCEs (GHSA-2xp9-vwfh-vxw4, CVE-2026-75604), the July 2026 set (CVE-2026-64641 through CVE-2026-64649) and the earlier CVE-2025-29927 middleware bypass. Patch to 16.3.8+ (16.x) or 15.5.27+ (15.x) — note 16.3.7 is NOT the patched release; 14.x and older have no fix branch. Vercel has postponed one further critical and one high fix pending upstream dependencies, so expect another release.",
+      "October 2026 out-of-band security release (2026-10-14), the fixes Vercel postponed from September: two CRITICAL unauthenticated RCEs — in the Image Optimization API when SVG files are used, via a memory bug in an upstream library (sharp/librsvg) on glibc-based Linux (CVE-2026-96889 / GHSA-2464-fhr4-w9xw; affects >=10.0.0 <=15.5.27 and 16.x <=16.4.0; workaround: make sure Next.js uses sharp 0.35.5+), and in `use cache` functions returning multiple typed arrays with Cache Components (GHSA-673q-mjm6-r5xr; 16.x <=16.4.0; no workaround) — plus a HIGH denial of service in App Router apps with at least one Server Action (GHSA-p3m5-59mp-jv5r; >=13.0.0 <=15.5.27 and 16.x <=16.4.0). There is no patched 16.3.x: patch to 16.4.1+ (16.x) or 15.5.28+ (15.x); 14.x and older have no fix branch. This is on top of the 2026-09-30 September release (HIGH Image Optimization SSRF CVE-2026-94483 plus medium/low issues CVE-2026-94484, -94485, -94486, -94543, -94544), the 2026-09-22 CRITICAL next/og RCE (CVE-2026-94545), the August 2026 critical unauthenticated RCEs (GHSA-2xp9-vwfh-vxw4, CVE-2026-75604), the July 2026 set (CVE-2026-64641 through CVE-2026-64649) and the earlier CVE-2025-29927 middleware bypass.",
+  },
+  {
+    // The upstream package behind CVE-2026-96889. Next.js 16.4.1+ / 15.5.28+
+    // make package managers pull a fixed sharp themselves (covered by the `next`
+    // floor above), so this entry is for apps that depend on sharp DIRECTLY.
+    // Floor 0.35.5 = GHSA-wq5f-xc86-pv6w (librsvg, affected < 0.35.5), which
+    // subsumes GHSA-rgj7-g3m4-5g8c (libheif, < 0.35.4) and GHSA-f88m-g3jw-g9cj
+    // (libvips, < 0.35.0).
+    name: "sharp",
+    fixedBelow: [0, 35, 5],
+    advisory:
+      "CVE-2026-96889 / GHSA-wq5f-xc86-pv6w (High, CVSS 8.9): a use-after-free in the bundled librsvg can lead to possible remote code execution on glibc-based Linux; downstream this became a critical unauthenticated RCE in the Next.js Image Optimization API for SVG files. Affects < 0.35.5 — upgrade to 0.35.5 (ships librsvg 2.63.2). Older versions also carry GHSA-rgj7-g3m4-5g8c (libheif heap overflow, fixed in 0.35.4) and GHSA-f88m-g3jw-g9cj (libvips CVE-2026-33327, -33328, -35590, -35591, fixed in 0.35.0). Workaround if you cannot upgrade yet: stop sharp decoding SVG with sharp.block({ operation: [\"VipsForeignLoadSvg\"] }).",
   },
   {
     // The upstream package behind CVE-2026-94545. Next.js bundles its own copy
