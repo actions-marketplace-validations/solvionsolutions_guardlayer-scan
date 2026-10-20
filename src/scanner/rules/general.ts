@@ -262,19 +262,22 @@ const KNOWN_VULN_DEPS: {
   // `react-dom`. Flagging `react` itself would be a false positive (and a false
   // claim). Next.js vendors its own copy of these packages, so Next apps are
   // covered by the `next` floor instead; these entries catch other RSC setups.
-  // Floors are the LATEST fix, CVE-2026-44907 (GHSA-wx67-qw84-cm4g, 2026-07-21),
-  // which subsumes CVE-2026-23864 / -23869 / -23870. 18.x and 19.3+ are
-  // unlisted branches and stay silent (see depFixTarget).
+  // Floors are the LATEST fix, the 2026-10-14 pair GHSA-xqc2-xf4c-x3h3
+  // (critical RCE) + GHSA-h3gv-c5rc-p453 (high DoS), published by the React repo
+  // with no CVE yet. They list 19.0.0-19.3.0 as affected and subsume the July
+  // CVE-2026-44907 floors. 18.x is an unlisted branch and stays silent (see
+  // depFixTarget).
   ...["react-server-dom-webpack", "react-server-dom-parcel", "react-server-dom-turbopack"].map(
     (name) => ({
       name,
       fixedByBranch: {
-        "19.0": [19, 0, 8] as [number, number, number],
-        "19.1": [19, 1, 9] as [number, number, number],
-        "19.2": [19, 2, 8] as [number, number, number],
+        "19.0": [19, 0, 9] as [number, number, number],
+        "19.1": [19, 1, 10] as [number, number, number],
+        "19.2": [19, 2, 9] as [number, number, number],
+        "19.3": [19, 3, 1] as [number, number, number],
       },
       advisory:
-        "React Server Components denial of service via crafted requests to Server Function endpoints (out-of-memory / CPU exhaustion) — CVE-2026-44907 (July 2026), the latest of four such advisories this year (CVE-2026-23864, -23869, -23870). Patched in 19.0.8, 19.1.9 and 19.2.8.",
+        "React Server Components (October 14, 2026): CRITICAL unauthenticated remote code execution (GHSA-xqc2-xf4c-x3h3) and a HIGH denial of service in Server Functions (GHSA-h3gv-c5rc-p453), affecting 19.0.0 through 19.3.0. This is on top of the July 2026 DoS CVE-2026-44907 and the earlier CVE-2026-23864, -23869, -23870. Patched in 19.0.9, 19.1.10, 19.2.9 and 19.3.1.",
     })
   ),
   {
