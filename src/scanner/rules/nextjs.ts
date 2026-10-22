@@ -5,6 +5,9 @@ import {
   isEdgeFunction,
   isTestPath,
   matchAll,
+  middlewareFileKind,
+  isNextProxyCode,
+  isProxyEntryPath,
   snippetAt,
   lineAt,
   columnAt,
@@ -1123,6 +1126,15 @@ function scanApiRouteInput(f: ScanFile): RuleMatch[] {
 // middleware.ts and a TanStack Start request middleware under src/lib/access/.
 // Next.js never loads those, so the rule now needs an entry-file location AND a
 // Next.js middleware export. All 17 real entry files were still checked.
+//
+// Next.js 16 renamed middleware.ts to proxy.ts and the `middleware` export to
+// `proxy` (see middlewareFileKind). Both names are entry files here, each with
+// the export forms the Next.js build accepts for it: a proxy.ts that still
+// exports only `middleware` fails the build, so it stays silent. "proxy" is also
+// an everyday name for code that is not a Next.js entry (a Vercel function at
+// api/proxy.ts, a fetch wrapper at src/proxy.ts, a request-forwarding helper at
+// app/api/proxy.ts), so a proxy file must sit at a project-root shape
+// (isProxyEntryPath) and look like Next.js server code (isNextProxyCode).
 
 // Paths where Next.js can never load middleware: well-known helper folders as the
 // immediate parent, or 2 or more directories below a src/ segment (src/lib/supabase/middleware.ts).
@@ -1142,8 +1154,59 @@ const NON_ENTRY_MW_PATH =
 // export { default } from 'next-auth/middleware'; export { mw as default }; export * from '...'.
 // ReDoS-safe: every alternative is anchored on a literal `export`, the brace
 // bodies are bounded ([^}]{0,300}) and cannot run past the closing brace.
+// Global: read only through hasLiveExport (matchAll), never .test().
 const NEXT_MW_EXPORT =
-  /\bexport\s+default\b|\bexport\s+(?:async\s+)?function\s+middleware\b|\bexport\s+(?:const|let|var)\s+middleware\b|\bexport\s+(?:const|let|var)\s*\{[^}]{0,300}\bmiddleware\b|\bexport\s*\{[^}]{0,300}\b(?:middleware|default)\b|\bexport\s*\*\s*from\b/;
+  /\bexport\s+default\b|\bexport\s+(?:async\s+)?function\s+middleware\b|\bexport\s+(?:const|let|var)\s+middleware\b|\bexport\s+(?:const|let|var)\s*\{[^}]{0,300}\bmiddleware\b|\bexport\s*\{[^}]{0,300}\b(?:middleware|default)\b|\bexport\s*\*\s*from\b/g;
+
+// The proxy.ts exports the Next.js build accepts (validateMiddlewareProxyExports in
+// next/dist/build/analysis/get-page-static-info.js, next 16.4.2): a default export,
+// export (async) function proxy, export const|let|var proxy = ..., or a named
+// specifier that exports `proxy` (export { auth as proxy } from '@/auth').
+// A destructured export (export const { auth: proxy } = NextAuth(...)) and
+// export * do not count there: the build rejects them with "must export a
+// function, either as a default export or as a named "proxy" export".
+// proxyConfig / createProxy do not match. Same bounds as NEXT_MW_EXPORT.
+const NEXT_PROXY_EXPORT =
+  /\bexport\s+default\b|\bexport\s+(?:async\s+)?function\s+proxy\b|\bexport\s+(?:const|let|var)\s+proxy\b|\bexport\s*\{[^}]{0,300}\bproxy\b/g;
+
+// Next's build only runs that export check when the source matches its
+// PARSE_PATTERN (copied verbatim from get-page-static-info.js, next 16.4.2).
+// A file with none of those words skips the check, so there
+// export { auth as default } from './auth' and export * from './auth' are
+// accepted too (NEXT_PROXY_UNCHECKED_EXPORT).
+const NEXT_EXPORT_CHECK_TRIGGER =
+  /(?<!(_jsx|jsx-))runtime|preferredRegion|getStaticProps|getServerSideProps|generateStaticParams|unstable_paramMatching|unstable_generateParamMatching|export const|generateImageMetadata|generateSitemaps|middleware|proxy/;
+const NEXT_PROXY_UNCHECKED_EXPORT = /\bexport\s*\{[^}]{0,300}\bdefault\b|\bexport\s*\*\s*from\b/g;
+
+// Does this proxy.ts export something the Next.js build accepts as its handler?
+function hasNextProxyExport(content: string): boolean {
+  if (hasLiveExport(content, NEXT_PROXY_EXPORT)) return true;
+  return !NEXT_EXPORT_CHECK_TRIGGER.test(content) && hasLiveExport(content, NEXT_PROXY_UNCHECKED_EXPORT);
+}
+
+// Inside a /* ... */ block that opened on an earlier line and is still open at
+// idx. Only an opener that starts its line counts: '/api/*' in a path list
+// holds a '/*' too, and treating it as a comment would hide a live export.
+function inBlockComment(content: string, idx: number): boolean {
+  const open = content.lastIndexOf("/*", idx);
+  if (open === -1 || content.lastIndexOf("*/", idx) > open) return false;
+  const lineStart = content.lastIndexOf("\n", open - 1) + 1;
+  return /^[ \t]*$/.test(content.slice(lineStart, open));
+}
+
+// Does a match of `re` (a global regex) sit outside comments? A commented-out
+// `// export function proxy(...)` is not an export Next.js would load. At most
+// 50 matches are examined, so the lookbacks stay bounded on hostile input.
+function hasLiveExport(content: string, re: RegExp): boolean {
+  let n = 0;
+  for (const m of content.matchAll(re)) {
+    if (++n > 50) break;
+    const i = m.index!;
+    if (isCommentedOut(content, i) || inBlockComment(content, i)) continue;
+    return true;
+  }
+  return false;
+}
 
 // A config object literal (optionally typed, as in `config: MiddlewareConfig =`) that holds a
 // live `matcher` key: matcher:, "matcher":, or shorthand { matcher }. A matcher that is
@@ -1420,11 +1483,11 @@ export const nextjsRules: Rule[] = [
   },
 
   // ──────────────────────────────────────────────────────────────────────
-  // INFO — middleware with no matcher config
+  // INFO — middleware / proxy with no matcher config
   // ──────────────────────────────────────────────────────────────────────
   {
     id: "nextjs/middleware-no-matcher",
-    title: "Middleware without a route matcher",
+    title: "Middleware or proxy without a route matcher",
     severity: "info",
     category: "nextjs",
     cwe: "CWE-1188",
@@ -1432,19 +1495,27 @@ export const nextjsRules: Rule[] = [
     // no matcher the middleware runs EVERYWHERE. The recommendation no longer pushes
     // an allowlist of protected paths, which is exactly how middleware bypasses happen.
     message:
-      "This Next.js middleware does auth or redirect logic but exports no config.matcher, so it runs on every request, including static assets and prefetches. That gives the broadest coverage, but every request pays for it, and path filtering moves into code where it is easy to get wrong. Middleware should also never be your only auth check (CVE-2025-29927): verify the session again in route handlers, server actions and RLS.",
+      "This Next.js middleware (proxy.ts since Next.js 16) does auth or redirect logic but exports no config.matcher, so it runs on every request, including static assets and prefetches. That gives the broadest coverage, but every request pays for it, and path filtering moves into code where it is easy to get wrong. Middleware should also never be your only auth check (CVE-2025-29927): verify the session again in route handlers, server actions and RLS.",
     recommendation:
-      "Add export const config = { matcher: [...] } that excludes only static internals (for example '/((?!_next/static|_next/image|favicon.ico).*)'), so every page and /api route still passes through. Don't narrow the matcher to a hand-picked list of protected paths: any route missing from that list skips the middleware entirely.",
-    // Next.js only loads middleware from a project root (or its src/). Helper
-    // modules that merely share the file name (Supabase updateSession helpers in
-    // lib/supabase/, Express/TanStack middleware) are not entries — see
-    // NON_ENTRY_MW_PATH.
-    appliesTo: (f) =>
-      /(^|[\/\\])middleware\.(ts|js)$/.test(f.path) && !NON_ENTRY_MW_PATH.test(f.path),
+      "Add export const config = { matcher: [...] } that excludes only static internals (for example '/((?!_next/static|_next/image|favicon.ico).*)'), so every page and /api route still passes through. The config works the same in proxy.ts and middleware.ts. Don't narrow the matcher to a hand-picked list of protected paths: any route missing from that list skips the check entirely.",
+    // Next.js only loads middleware / proxy from a project root (or its src/).
+    // Helper modules that merely share the file name (Supabase updateSession
+    // helpers in lib/supabase/, Express/TanStack middleware) are not entries —
+    // see NON_ENTRY_MW_PATH. proxy.ts uses the stricter isProxyEntryPath
+    // (app/api/proxy.ts, src/services/proxy.ts and lib/proxy.ts are helpers).
+    appliesTo: (f) => {
+      const kind = middlewareFileKind(f.path);
+      if (kind === "proxy") return isProxyEntryPath(f.path);
+      return kind === "middleware" && !NON_ENTRY_MW_PATH.test(f.path);
+    },
     scan: (f) => {
       // Helper modules (updateSession, accessMiddleware, astro onRequest, ...)
       // export no Next.js middleware handler, so Next.js never runs them.
-      if (!NEXT_MW_EXPORT.test(f.content)) return [];
+      if (middlewareFileKind(f.path) === "proxy") {
+        if (!hasNextProxyExport(f.content) || !isNextProxyCode(f.content)) return [];
+      } else if (!hasLiveExport(f.content, NEXT_MW_EXPORT)) {
+        return [];
+      }
       const doesAuth = /auth|getUser|getSession|token|cookie|redirect/i.test(
         f.content
       );

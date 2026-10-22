@@ -14,6 +14,9 @@ import {
   sqlStatementEnd,
   isTestPath,
   stripJsComments,
+  middlewareFileKind,
+  isNextProxyCode,
+  isProxyEntryPath,
 } from "../helpers";
 
 const isJsLike = (f: ScanFile) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(f.path);
@@ -2906,14 +2909,33 @@ export const supabaseRules: Rule[] = [
     category: "supabase",
     cwe: "CWE-287",
     message:
-      "supabase.auth.getSession() is called in server middleware. On the server it reads the session straight from the request cookies WITHOUT verifying the JWT, so a forged cookie can spoof it. Supabase's guidance is to use getUser() (or getClaims()) — which revalidates the token with the Auth server — for any authorization decision.",
+      "supabase.auth.getSession() is called in server middleware (middleware.ts, or proxy.ts since Next.js 16). On the server it reads the session straight from the request cookies WITHOUT verifying the JWT, so a forged cookie can spoof it. Supabase's guidance is to use getUser() (or getClaims()) — which revalidates the token with the Auth server — for any authorization decision.",
     recommendation:
-      "In server code (middleware, route handlers, server actions) authorize with supabase.auth.getUser() — it revalidates the JWT — not getSession(). getSession() is fine on the client, where the session is already trusted.",
-    appliesTo: (f) =>
-      isJsLike(f) && /(^|[\/\\])middleware\.(ts|js)$/.test(f.path),
+      "In server code (middleware or proxy, route handlers, server actions) authorize with supabase.auth.getUser() — it revalidates the JWT — not getSession(). getSession() is fine on the client, where the session is already trusted.",
+    // middleware.ts (any path, as before) or its Next.js 16 name proxy.ts (see
+    // middlewareFileKind). "proxy" is also an everyday name for a route helper
+    // that forwards a request to a backend (app/api/proxy.ts,
+    // src/services/proxy.ts), so a proxy.ts counts only where Next.js loads it
+    // (isProxyEntryPath) or as a Supabase session helper in a supabase/ folder
+    // (lib/supabase/proxy.ts, the counterpart of lib/supabase/middleware.ts),
+    // which runs inside the gate.
+    appliesTo: (f) => {
+      if (!isJsLike(f)) return false;
+      const kind = middlewareFileKind(f.path);
+      if (kind === "proxy") {
+        return isProxyEntryPath(f.path) || /(?:^|[\/\\])supabase[\/\\]proxy\.(?:ts|js)$/.test(f.path);
+      }
+      return kind === "middleware";
+    },
     scan: (f) => {
       // Server-only footgun; a client component using getSession is fine.
       if (isClientComponent(f.content)) return [];
+      // A proxy.ts can also be a browser fetch wrapper that reads getSession()
+      // to attach the access token as a Bearer header, which is the documented
+      // client-side use (and a Vite/SPA file has no 'use client' to tell). A
+      // proxy file counts only when it is Next.js server code: the same
+      // isNextProxyCode gate as nextjs/middleware-no-matcher.
+      if (middlewareFileKind(f.path) === "proxy" && !isNextProxyCode(f.content)) return [];
       if (!/\.auth\.getSession\s*\(/.test(f.content)) return [];
       // If the file ALSO revalidates with getUser()/getClaims(), it's doing the
       // right thing — the getSession call isn't the trust boundary.

@@ -371,6 +371,92 @@ export function isApiRoute(path: string): boolean {
   return /app[\/\\].*route\.(ts|js|tsx|jsx)$/.test(path) || /pages[\/\\]api[\/\\]/.test(path);
 }
 
+/**
+ * Which Next.js request-interception file name does this path have:
+ * "middleware", "proxy", or null?
+ *
+ * Next.js 16.0.0 deprecated the `middleware` file convention and renamed it to
+ * `proxy`: middleware.ts becomes proxy.ts, the exported function `middleware`
+ * becomes `proxy`, and config.matcher is unchanged (next/dist/docs/01-app/
+ * 03-api-reference/03-file-conventions/proxy.md, "Version history"). Next 16
+ * still loads middleware.ts, with a deprecation warning, and its build checks
+ * each file for its OWN export name: proxy.ts needs a default or `proxy`
+ * export, middleware.ts a default or `middleware` one
+ * (validateMiddlewareProxyExports in next/dist/build/analysis/
+ * get-page-static-info.js, next 16.4.2; it skips that check when the source has
+ * none of the words in its PARSE_PATTERN). A rule keyed on `middleware.*` alone
+ * goes silent on every app that has migrated.
+ *
+ * File name only. Whether Next.js actually loads a file with this name (project
+ * root or src/, not lib/supabase/) is up to each rule: see isProxyEntryPath.
+ */
+export function middlewareFileKind(path: string): "middleware" | "proxy" | null {
+  const m = /(?:^|[\/\\])(middleware|proxy)\.(?:ts|js)$/.exec(path);
+  return m ? (m[1] as "middleware" | "proxy") : null;
+}
+
+/**
+ * The file uses a Next.js request API or a Next.js auth integration: an import
+ * of next/server (or its NextRequest / NextResponse / NextProxy types),
+ * request.nextUrl, next-auth, @clerk/nextjs or next-intl. "proxy" is a generic
+ * file name (a Vercel function at api/proxy.ts, a fetch wrapper at
+ * src/proxy.ts, a Cloudflare Worker), so the proxy-file rules ask for this
+ * before they treat a proxy.ts as Next.js code. middleware.ts rules do not.
+ * ReDoS-safe: every alternative starts with a literal and each package-path
+ * tail is bounded.
+ */
+export const NEXT_REQUEST_API =
+  /\bfrom\s*["'](?:next\/server|next-auth(?:\/[\w-]{1,40})?|@clerk\/nextjs(?:\/[\w-]{1,40})?|next-intl(?:\/[\w-]{1,40})?)["']|\brequire\s*\(\s*["']next\/server["']\s*\)|\b(?:NextRequest|NextResponse|NextFetchEvent|NextProxy|NextMiddleware|ProxyConfig|NextAuth|clerkMiddleware)\b|\.nextUrl\b/;
+
+// Other signs that a proxy.ts is Next.js server code: a cookie-backed
+// @supabase/ssr client, an Auth.js-wrapped default export
+// (export default auth((req) => ...)), or a re-export under the entry's name
+// (export { auth as proxy }, export { auth as default } from './auth'). These
+// files can have no next/server import at all. ReDoS-safe: literal anchors and
+// a bounded brace body.
+const NEXT_PROXY_SIGNAL =
+  /\bcreateServerClient\b|\bexport\s+default\s+auth\b|\bexport\s*\{[^}]{0,300}\b(?:as\s+proxy|auth\s+as\s+default)\b/;
+
+/**
+ * Does a proxy.ts look like Next.js server code? NEXT_REQUEST_API or one of the
+ * NEXT_PROXY_SIGNAL forms. Both proxy-file rules use this same gate.
+ */
+export function isNextProxyCode(content: string): boolean {
+  return NEXT_REQUEST_API.test(content) || NEXT_PROXY_SIGNAL.test(content);
+}
+
+// One top-level folder that holds source code rather than a Next.js project, so
+// a proxy.ts directly inside it is a helper (services/proxy.ts, api/proxy.ts).
+const PROXY_NON_ROOT_DIR =
+  /^(?:src|lib|libs|utils|util|helpers|supabase|server|pages|routes|components|middlewares|api|apis|services|service|features|modules|hooks|core|common|shared|config|handlers|controllers|providers|proxy|proxies|http|network)$/i;
+
+/**
+ * Is this proxy.ts / proxy.js in a place where Next.js loads it? Next.js runs
+ * only the file at the project root or in its src/ (page '/proxy' or
+ * '/src/proxy' in validateMiddlewareProxyExports; proxy.md: "in the project
+ * root, or inside `src`"). "proxy" is a common name for a request-forwarding
+ * helper (app/api/proxy.ts, src/services/proxy.ts, features/auth/proxy.ts), so
+ * unlike middleware.ts this is an allowlist of project-root shapes:
+ *   - the repo root;
+ *   - one top-level folder that is not a source folder (PROXY_NON_ROOT_DIR):
+ *     a Next.js app kept in web/ or frontend/, or the project folder that a
+ *     folder upload puts first in every path;
+ *   - a monorepo app, apps/<name>, optionally under that upload folder.
+ * Each may end in src/. The scanner sees one file at a time and cannot find the
+ * real project root, so this is a heuristic: a project root with another
+ * shape (packages/<name>, src/<name>) is not checked.
+ */
+export function isProxyEntryPath(path: string): boolean {
+  const segs = path.replace(/\\/g, "/").replace(/^\.?\/+/, "").split("/");
+  if (!/^proxy\.(?:ts|js)$/.test(segs[segs.length - 1])) return false;
+  const dirs = segs.slice(0, -1);
+  if (dirs.length > 0 && dirs[dirs.length - 1] === "src") dirs.pop();
+  if (dirs.length === 0) return true;
+  if (dirs.length === 1) return !PROXY_NON_ROOT_DIR.test(dirs[0]);
+  if (dirs.length > 3) return false;
+  return dirs[dirs.length - 2].toLowerCase() === "apps";
+}
+
 /** Is this a SQL/migration file? */
 export function isSql(path: string): boolean {
   return path.toLowerCase().endsWith(".sql");

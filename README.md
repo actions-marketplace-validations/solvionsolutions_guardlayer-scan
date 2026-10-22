@@ -1,6 +1,6 @@
 # GuardLayer Scan — free security scanner for Next.js + Supabase (GitHub Action)
 
-**GuardLayer Scan is a free, open-source static security scanner for Next.js + Supabase apps that runs in your CI.** Drop it into any GitHub workflow and it catches the mistakes that actually leak data in these stacks — exposed secrets, missing Row Level Security, unverified webhooks, and unguarded Server Actions — and comments them inline on the pull request before they ship. No signup, no account, no code leaves your runner.
+**GuardLayer Scan is a free, open-source (MIT) GitHub Action that statically scans your Next.js + Supabase repo for exposed secrets, missing Row Level Security, unguarded Server Actions, unverified webhooks and known-vulnerable dependencies.** It marks findings as annotations on the exact file and line, lists them in a summary on the workflow run, and can fail the build on critical issues. No signup, no account, no API key, and your code never leaves the runner.
 
 It runs the same static engine as [guardlayer.io](https://www.guardlayer.io). Want to try the rules before wiring up CI? Paste a migration into the [free in-browser checker](https://www.guardlayer.io/supabase-security-checker) — it runs client-side, nothing is uploaded.
 
@@ -22,7 +22,7 @@ jobs:
           fail-on: critical   # critical | warning | never
 ```
 
-That's it. Findings appear as annotations on the exact file and line, plus a summary on the run. By default the build fails only on **critical** issues.
+That's it. Findings appear as annotations on the exact file and line, plus a summary on the run. By default the build fails only on **critical** issues. A failed run blocks a merge only if you make this job a required status check in your branch protection rules.
 
 ## What's new (October 2026)
 
@@ -66,9 +66,19 @@ Add a `.guardlayerignore` (gitignore syntax) to your repo root to exclude test f
 
 ## How it works
 
-The Action walks your checked-out repo, runs GuardLayer's static analysis in-process, and emits GitHub annotations. It's pure static analysis — nothing is uploaded, no API key is required, and it works on private repos.
+The Action walks your checked-out repo, runs GuardLayer's static analysis in-process, emits GitHub annotations and writes the job summary. It doesn't post pull request comments. It's pure static analysis — nothing is uploaded, no API key is required, and it works on private repos.
 
-Want the same checks on every push with PR comments and a hosted dashboard, plus AI-written fixes? That's the hosted [GuardLayer](https://www.guardlayer.io) — free on one repository.
+Want pull request comments, a GuardLayer check on every push and pull request, and a hosted dashboard? That's the hosted [GuardLayer](https://www.guardlayer.io) GitHub App, with the same checks: free for public repos, with paid plans for private ones.
+
+## Badge
+
+To show that a repo is scanned by GuardLayer, add this to its README:
+
+```markdown
+[![Scanned by GuardLayer](https://www.guardlayer.io/badge.svg)](https://www.guardlayer.io/?utm_source=badge&utm_medium=readme)
+```
+
+The badge is a static image, the same for every repo. It shows no score and no findings, so it says nothing about how secure a repo is.
 
 ## License
 

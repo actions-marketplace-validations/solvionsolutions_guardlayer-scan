@@ -95,5 +95,13 @@ export interface ScanReport {
      *  (full-repo scans) GitHub truncated the tree, the file cap was hit, or a
      *  file couldn't be read. */
     truncated?: boolean;
+    /** Stored: a Free account's one-time preview scan of a private repo
+     *  (lib/github/private-preview-rules.ts). Set server-side before the
+     *  report is saved, never from a request. */
+    preview?: boolean;
+    /** Served, never stored: this copy of a preview has its file paths, line
+     *  numbers, code snippets and fixes removed (redactPreviewReport), because
+     *  the viewer isn't on a paid plan. */
+    gated?: boolean;
   };
 }
