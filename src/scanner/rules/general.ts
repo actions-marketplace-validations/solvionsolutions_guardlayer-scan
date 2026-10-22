@@ -1,4 +1,4 @@
-import type { Rule, RuleMatch, ScanFile } from "../types";
+import type { Rule, RuleMatch, ScanFile, Severity } from "../types";
 import {
   hasUseServer,
   isApiRoute,
@@ -179,10 +179,24 @@ const KNOWN_VULN_DEPS: {
   /** A floor INSIDE a prerelease line, e.g. 5.0.0-beta.32. `parseVersion` drops
    *  the tag, so `5.0.0-beta.31` (vulnerable) and `-beta.32` (patched) both
    *  collapse to [5,0,0] and are invisible to every numeric compare above. This
-   *  is the only way to catch a critical advisory that is fixed within a beta
-   *  line, which is where next-auth v5 has lived for a long time. */
+   *  is the only way to catch an advisory that is fixed within a beta line,
+   *  which is where next-auth v5 has lived for a long time. */
   fixedByPrerelease?: { base: string; tag: string; below: number };
   advisory: string;
+  /** Severity of a finding against this entry; omitted = "warning" (the rule
+   *  default). "critical" FAILS the GuardLayer check under the default gate
+   *  policy, so it is set ONLY when the advisory that sets the entry's CURRENT
+   *  floor is rated Critical by its publisher: the maintainers' own GitHub
+   *  advisory or release post, and GitHub's reviewed database / NVD only where
+   *  the maintainers published none. A third-party re-rating never promotes an
+   *  entry (next-auth: maintainers say Low, GitHub's database says Critical ->
+   *  stays a warning). Re-check this on EVERY floor bump: a new floor set by a
+   *  High advisory must drop the entry back to a warning. */
+  severity?: "critical" | "warning";
+  /** With severity "critical": the lowest version the critical advisory lists
+   *  as affected. An older version still fires (it is below the floor), but as
+   *  a warning, because the critical rating does not reach it. */
+  criticalFrom?: [number, number, number];
 }[] = [
   {
     name: "next",
@@ -223,6 +237,14 @@ const KNOWN_VULN_DEPS: {
     // concrete (no placeholders) and match the release post. 16.4.2 (2026-10-15)
     // is a bugfix-only follow-up; the patched floor is 16.4.1.
     fixedByMajor: { 15: [15, 5, 28], 16: [16, 4, 1] },
+    // CRITICAL — verified 2026-10-22: both floors are set by GHSA-2464-fhr4-w9xw,
+    // which vercel/next.js publishes as "Critical" (CVSS 4.0 9.5) and the
+    // 2026-10-14 release post labels "Critical Severity"; the 16 floor also by
+    // GHSA-673q-mjm6-r5xr (Critical, 9.5). GHSA-p3m5 (DoS) is only High.
+    // GHSA-2464 lists >=10.0.0 as affected, so a pre-10 `next` (flagged because
+    // it has no fix branch) stays a warning.
+    severity: "critical",
+    criticalFrom: [10, 0, 0],
     advisory:
       "October 2026 out-of-band security release (2026-10-14), the fixes Vercel postponed from September: two CRITICAL unauthenticated RCEs — in the Image Optimization API when SVG files are used, via a memory bug in an upstream library (sharp/librsvg) on glibc-based Linux (CVE-2026-96889 / GHSA-2464-fhr4-w9xw; affects >=10.0.0 <=15.5.27 and 16.x <=16.4.0; workaround: make sure Next.js uses sharp 0.35.5+), and in `use cache` functions returning multiple typed arrays with Cache Components (GHSA-673q-mjm6-r5xr; 16.x <=16.4.0; no workaround) — plus a HIGH denial of service in App Router apps with at least one Server Action (GHSA-p3m5-59mp-jv5r; >=13.0.0 <=15.5.27 and 16.x <=16.4.0). There is no patched 16.3.x: patch to 16.4.1+ (16.x) or 15.5.28+ (15.x); 14.x and older have no fix branch. This is on top of the 2026-09-30 September release (HIGH Image Optimization SSRF CVE-2026-94483 plus medium/low issues CVE-2026-94484, -94485, -94486, -94543, -94544), the 2026-09-22 CRITICAL next/og RCE (CVE-2026-94545), the August 2026 critical unauthenticated RCEs (GHSA-2xp9-vwfh-vxw4, CVE-2026-75604), the July 2026 set (CVE-2026-64641 through CVE-2026-64649) and the earlier CVE-2025-29927 middleware bypass.",
   },
@@ -267,9 +289,13 @@ const KNOWN_VULN_DEPS: {
   // with no CVE yet. They list 19.0.0-19.3.0 as affected and subsume the July
   // CVE-2026-44907 floors. 18.x is an unlisted branch and stays silent (see
   // depFixTarget).
+  // CRITICAL — verified 2026-10-22: GHSA-xqc2-xf4c-x3h3 is published by the
+  // React repo as "Critical" (CVSS 4.0 9.5) and its affected list is exactly
+  // every version below these branch floors, so every finding here is in range.
   ...["react-server-dom-webpack", "react-server-dom-parcel", "react-server-dom-turbopack"].map(
     (name) => ({
       name,
+      severity: "critical" as const,
       fixedByBranch: {
         "19.0": [19, 0, 9] as [number, number, number],
         "19.1": [19, 1, 10] as [number, number, number],
@@ -294,13 +320,29 @@ const KNOWN_VULN_DEPS: {
     // is correct — the fix landed before stable.
     fixedByMajor: { 4: [4, 24, 15] },
     fixedByPrerelease: { base: "5.0.0", tag: "beta", below: 32 },
+    // WARNING, not critical — verified 2026-10-22: the maintainers' own advisory
+    // GHSA-8fpg-xm3f-6cx3 (the v5 floor) is rated "Low"; only GitHub's reviewed
+    // database re-rates it Critical 9.1, which does not count (see `severity`).
+    // The v4 floor is CVE-2026-73419 / GHSA-x445-f3h2-j279, rated Moderate.
     advisory:
-      "CRITICAL fail-open in Auth.js v5 — CVE-2026-73421 / GHSA-8fpg-xm3f-6cx3 (CVSS 9.1): from 5.0.0-beta.0 until 5.0.0-beta.32, an app that gates access by checking only that the `auth()` object exists can FAIL OPEN when Auth.js hits a server configuration error (a provider missing issuer/authorization endpoints, or an unset AUTH_SECRET) — the object is populated with an error instead of being null, so routes protected only by session existence silently grant access to every visitor. Also CVE-2026-73419: OAuth state/nonce/PKCE check cookies are not bound to the issuing provider, enabling provider confusion and unauthorized account linking. Fixed in 4.24.15 (v4) and 5.0.0-beta.32 (v5).",
+      "Fail-open in Auth.js v5 — CVE-2026-73421 / GHSA-8fpg-xm3f-6cx3 (rated Low by the Auth.js maintainers; GitHub's reviewed Advisory Database rates it Critical, CVSS 9.1): from 5.0.0-beta.0 until 5.0.0-beta.32, an app that gates access by checking only that the `auth()` object exists can FAIL OPEN when Auth.js hits a server configuration error (a provider missing issuer/authorization endpoints, or an unset AUTH_SECRET) — the object is populated with an error instead of being null, so routes protected only by session existence silently grant access to every visitor. Also CVE-2026-73419: OAuth state/nonce/PKCE check cookies are not bound to the issuing provider, enabling provider confusion and unauthorized account linking. Fixed in 4.24.15 (v4) and 5.0.0-beta.32 (v5).",
   },
   { name: "lodash", fixedBelow: [4, 17, 21], advisory: "Prototype pollution / ReDoS fixed in lodash 4.17.21." },
   { name: "axios", fixedBelow: [1, 8, 0], advisory: "SSRF / credential leak advisories fixed in axios 1.8.0." },
   { name: "jsonwebtoken", fixedBelow: [9, 0, 0], advisory: "Signature bypass issues fixed in jsonwebtoken 9.0.0." },
-  { name: "minimist", fixedBelow: [1, 2, 6], advisory: "Prototype pollution fixed in minimist 1.2.6." },
+  {
+    // CRITICAL — verified 2026-10-22: the floor is CVE-2021-44906 /
+    // GHSA-xvch-5gv4-984h, rated Critical (CVSS 3.1 9.8) by GitHub's advisory
+    // and by NVD; the maintainers published no advisory of their own. It is
+    // patched on BOTH lines (1.2.6 and 0.2.4), so the 0.x floor is 0.2.4: the
+    // old single 1.2.6 floor flagged patched 0.2.4+ — harmless as a warning,
+    // a false failing check as a critical.
+    name: "minimist",
+    fixedByMajor: { 0: [0, 2, 4], 1: [1, 2, 6] },
+    severity: "critical",
+    advisory:
+      "Prototype pollution (CVE-2021-44906 / GHSA-xvch-5gv4-984h, Critical, CVSS 9.8): minimist's argument parser can be made to set properties on Object.prototype. Fixed in 1.2.6 (and 0.2.4 on the 0.x line).",
+  },
   { name: "semver", fixedBelow: [7, 5, 2], advisory: "ReDoS fixed in semver 7.5.2." },
   { name: "ws", fixedBelow: [8, 17, 1], advisory: "DoS via many headers fixed in ws 8.17.1." },
 ];
@@ -382,6 +424,18 @@ function depFixTarget(
   }
   if (adv.fixedBelow) return lt(ver, adv.fixedBelow) ? adv.fixedBelow : null;
   return null;
+}
+
+/** The severity of one finding against `adv` at version `ver` (already known
+ *  to be below the floor). Critical only for an entry marked critical, and only
+ *  inside the critical advisory's own affected range (`criticalFrom`). */
+function depSeverity(
+  ver: [number, number, number],
+  adv: { severity?: "critical" | "warning"; criticalFrom?: [number, number, number] }
+): Severity {
+  if (adv.severity !== "critical") return "warning";
+  if (adv.criticalFrom && lt(ver, adv.criticalFrom)) return "warning";
+  return "critical";
 }
 
 const UUID_VALUE =
@@ -1656,7 +1710,9 @@ export const generalRules: Rule[] = [
   },
 
   // ──────────────────────────────────────────────────────────────────────
-  // WARNING — known-vulnerable dependency
+  // WARNING — known-vulnerable dependency. CRITICAL per finding when the
+  // advisory setting the floor is publisher-rated Critical (see
+  // KNOWN_VULN_DEPS `severity`) — that one fails the check by default.
   // ──────────────────────────────────────────────────────────────────────
   {
     id: "general/vulnerable-dependency",
@@ -1721,6 +1777,7 @@ export const generalRules: Rule[] = [
                 snippet:
                   idx >= 0 ? snippetAt(f.content, idx) : `"${adv.name}": "${raw}"`,
                 message: `${adv.name}@${raw}: ${adv.advisory} (upgrade to >= ${pre.base}-${pre.tag}.${pre.below}).`,
+                severity: depSeverity(parseVersion(pre.base) ?? [0, 0, 0], adv),
               });
             }
             // A recognised prerelease is fully decided here, either way.
@@ -1749,6 +1806,7 @@ export const generalRules: Rule[] = [
             snippet:
               idx >= 0 ? snippetAt(f.content, idx) : `"${adv.name}": "${raw}"`,
             message: `${adv.name}@${raw}: ${adv.advisory} (upgrade to >= ${target.join(".")}).${rangeNote}`,
+            severity: depSeverity(ver, adv),
           });
         }
       }
