@@ -24,6 +24,13 @@ jobs:
 
 That's it. Findings appear as annotations on the exact file and line, plus a summary on the run. By default the build fails only on **critical** issues.
 
+## What's new (October 2026)
+
+- **A vulnerable dependency can now fail the build.** When a dependency's latest security fix is for an advisory its publisher rates **Critical**, GuardLayer reports it as a critical finding, so the default `fail-on: critical` fails the run. Today that covers `next` below 16.4.1 on 16.x or 15.5.28 on 15.x (the October 14, 2026 release fixed two critical unauthenticated remote code execution bugs), `react-server-dom-*` below the 19.x patch releases, and `minimist`.
+- **To fix it,** upgrade the package, for example `npm install next@latest` (or `next@15.5.28` on 15.x).
+- **To report without failing** while you upgrade, set `fail-on: never`.
+- Also new: far fewer false positives across the board, and a table that a migration creates without RLS and grants to `anon` is now critical.
+
 ## What it checks
 
 36 checks across six areas:
