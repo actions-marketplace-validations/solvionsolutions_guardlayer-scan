@@ -157,9 +157,258 @@ const PRT_TRIGGER = new RegExp(
 
 /** An explicit checkout of the PULL REQUEST HEAD — i.e. the untrusted fork code.
  *  `pull_request_target` on its own checks out the BASE repo and is the safe
- *  default, so this second marker is what turns the pair into a finding. */
-const PR_HEAD_CHECKOUT =
-  /ref\s*:\s*["']?\$\{\{\s*github\.event\.pull_request\.head\.(?:sha|ref)\s*\}\}|refs\/pull\/[^\s"']{0,40}\/(?:merge|head)/i;
+ *  default, so this second marker is what turns the pair into a finding.
+ *  Shapes (* = one of the insecure inputs that GitHub's 2026-06-18
+ *  actions/checkout changelog lists, which current actions/checkout refuses
+ *  for fork PRs: the fork as repository, a refs/pull/N/head|merge ref, or a
+ *  ref that is the PR's head or merge commit SHA):
+ *    ref: ${{ github.event.pull_request.head.sha }}  *
+ *    ref: ${{ github.event.pull_request.head.ref }}  (a branch NAME: the guard
+ *         does not check it)
+ *    ref: ${{ github.event.pull_request.merge_commit_sha }}  *  (the test-merge
+ *         commit of refs/pull/N/merge: it contains the fork's changes)
+ *    refs/pull/<n>/merge | head, where <n> is a literal, a glob or a shell
+ *         variable, or an expression: refs/pull/${{ … }}/merge  *
+ *    repository: ${{ github.event.pull_request.head.repo.full_name }}  *
+ *  The `${{ … }}` form used to slip through: the old `[^\s"']{0,40}` stopped
+ *  at the spaces inside the braces. Global, so the rule can step past a match
+ *  in a YAML comment, in a non-checkout action's input, or in a job that
+ *  keeps fork PRs out (see prtSkipMatch). */
+const PR_HEAD_CHECKOUT = new RegExp(
+  [
+    String.raw`ref\s*:\s*["']?\$\{\{\s*github\.event\.pull_request\.(?:head\.(?:sha|ref)|merge_commit_sha)\s*\}\}`,
+    String.raw`refs\/pull\/(?:\$\{\{[^}\n]{1,120}\}\}|[^\s"']{0,40})\/(?:merge|head)`,
+    String.raw`\brepository\s*:\s*["']?\$\{\{\s*github\.event\.pull_request\.head\.repo\.full_name\s*\}\}`,
+  ].join("|"),
+  "gi"
+);
+
+// ── Workflow YAML lookups for general/workflow-prt-head-checkout ─────────
+// Indentation-based: enough to find the job, the step and the `with:` input
+// that hold a match. `lines` have any trailing \r removed.
+
+const wfIndent = (l: string) => l.length - l.trimStart().length;
+/** Blank or comment-only line. */
+const wfBlank = (l: string) => /^\s*(?:#.*)?$/.test(l);
+const wfIsItem = (l: string) => /^\s*-(?:\s|$)/.test(l);
+
+/** First line after the block headed by line h (key at column col): the block
+ *  is every following line indented deeper, blank and comment lines included. */
+function wfBlockEnd(lines: string[], h: number, col: number): number {
+  let e = h + 1;
+  while (e < lines.length && (wfBlank(lines[e]) || wfIndent(lines[e]) > col)) e++;
+  return e;
+}
+
+/** The `- ` list item (normally a step) that holds line ln, or -1. */
+function wfItemAt(lines: string[], ln: number): number {
+  if (wfIsItem(lines[ln])) return ln;
+  let cur = wfIndent(lines[ln]);
+  for (let i = ln - 1; i >= 0; i--) {
+    const l = lines[i];
+    if (wfBlank(l)) continue;
+    const ind = wfIndent(l);
+    if (ind >= cur) continue;
+    if (wfIsItem(l)) return i;
+    if (ind === 0) return -1;
+    cur = ind;
+  }
+  return -1;
+}
+
+/** Column of the keys of the list item on line i ("- uses: x" → after "- "). */
+function wfItemCol(lines: string[], i: number): number {
+  const m = /^(\s*-\s*)(\S)?/.exec(lines[i]);
+  if (!m) return -1;
+  if (m[2]) return m[1].length;
+  for (let j = i + 1; j < lines.length; j++) if (!wfBlank(lines[j])) return wfIndent(lines[j]);
+  return -1;
+}
+
+/** Text from `from` to `to` with any YAML/shell `#` comment cut off (see
+ *  wfCommentAt). */
+function wfUncomment(s: string, from: number, to: number): string {
+  const c = wfCommentAt(s, from, to);
+  return s.slice(from, c < 0 ? to : c);
+}
+
+/** Index of the first `#` comment in s[from, to), or -1. A `#` counts at the
+ *  start or after whitespace, outside '…' / "…" quotes: inside a `run: |`
+ *  block scalar `#` is plain text to YAML, so a quoted "PR #1" is not a
+ *  comment, while an unquoted ` #` there is a shell comment anyway. A quote
+ *  glued to a letter or digit (don't) opens nothing. */
+function wfCommentAt(s: string, from: number, to: number): number {
+  const st: WfScan = { pos: from, q: "", at: -1 };
+  wfScanTo(s, from, st, to);
+  return st.at;
+}
+
+/** Resumable state of the wfCommentAt scan of one line: the position
+ *  reached, the quote open there, and where a comment starts (-1: none yet). */
+type WfScan = { pos: number; q: string; at: number };
+
+/** Advance the comment scan of the text starting at `start` up to `to`. */
+function wfScanTo(s: string, start: number, st: WfScan, to: number): void {
+  for (; st.at < 0 && st.pos < to; st.pos++) {
+    const c = s[st.pos];
+    if (st.q) {
+      if (c === "\\" && st.q === '"') st.pos++;
+      else if (c === st.q) st.q = "";
+      continue;
+    }
+    if ((c === "'" || c === '"') && !(st.pos > start && /[A-Za-z0-9]/.test(s[st.pos - 1]))) st.q = c;
+    else if (c === "#" && (st.pos === start || /\s/.test(s[st.pos - 1]))) st.at = st.pos;
+  }
+}
+
+/** The value of `key` set directly on the mapping whose keys sit at column
+ *  col within lines [start, end): the text after the colon plus any deeper
+ *  continuation lines (a `>-` scalar), comments removed. null when unset. */
+function wfKeyValue(lines: string[], start: number, end: number, col: number, key: string): string | null {
+  const re = new RegExp("^(\\s*(?:-\\s+)?)" + key + "\\s*:");
+  for (let i = start; i < end; i++) {
+    const m = re.exec(lines[i]);
+    if (!m || m[1].length !== col) continue;
+    let v = wfUncomment(lines[i], m[0].length, lines[i].length);
+    for (let j = i + 1; j < end && (wfBlank(lines[j]) || wfIndent(lines[j]) > col); j++) {
+      if (!wfBlank(lines[j])) v += " " + wfUncomment(lines[j], 0, lines[j].length).trim();
+    }
+    return v;
+  }
+  return null;
+}
+
+/** The job (a key under the top-level `jobs:`) holding line ln: its head
+ *  line, block end and key column. null outside jobs. */
+function wfJobAt(lines: string[], ln: number): { head: number; end: number; col: number } | null {
+  let jobs = -1;
+  for (let i = ln; i >= 0; i--) {
+    if (/^jobs\s*:\s*(?:#.*)?$/.test(lines[i])) {
+      jobs = i;
+      break;
+    }
+  }
+  if (jobs < 0) return null;
+  let jobCol = -1;
+  for (let i = jobs + 1; i <= ln; i++) {
+    if (!wfBlank(lines[i])) {
+      jobCol = wfIndent(lines[i]);
+      break;
+    }
+  }
+  if (jobCol <= 0) return null;
+  let head = -1;
+  for (let i = ln; i > jobs; i--) {
+    if (!wfBlank(lines[i]) && wfIndent(lines[i]) === jobCol) {
+      head = i;
+      break;
+    }
+  }
+  if (head < 0 || head === ln) return null;
+  const end = wfBlockEnd(lines, head, jobCol);
+  for (let i = head + 1; i < end; i++) {
+    if (!wfBlank(lines[i])) {
+      const col = wfIndent(lines[i]);
+      return col > jobCol ? { head, end, col } : null;
+    }
+  }
+  return null;
+}
+
+/** Activity types of the pull_request_target trigger when written as a
+ *  mapping with a `types:` filter. null without one (the default types run)
+ *  or in a shape not read here. */
+function prtTypes(lines: string[]): string[] | null {
+  const unq = (s: string) => s.trim().replace(/^["']|["']$/g, "");
+  for (let i = 0; i < lines.length; i++) {
+    const t = /^(\s*)pull_request_target\s*:\s*(?:#.*)?$/.exec(lines[i]);
+    if (!t) continue;
+    const end = wfBlockEnd(lines, i, t[1].length);
+    for (let j = i + 1; j < end; j++) {
+      const m = /^(\s*)types\s*:/.exec(lines[j]);
+      if (!m) continue;
+      const v = wfUncomment(lines[j], m[0].length, lines[j].length).trim();
+      if (v.startsWith("[")) {
+        return v.endsWith("]") ? v.slice(1, -1).split(",").map(unq).filter(Boolean) : null;
+      }
+      if (v) return [unq(v)];
+      const out: string[] = [];
+      for (let k = j + 1; k < lines.length; k++) {
+        if (wfBlank(lines[k])) continue;
+        const it = /^\s*-\s+["']?([\w-]+)["']?\s*(?:#.*)?$/.exec(lines[k]);
+        if (!it || wfIndent(lines[k]) < m[1].length) break;
+        out.push(it[1]);
+      }
+      return out.length ? out : null;
+    }
+    return null;
+  }
+  return null;
+}
+
+const GH_PR = String.raw`github\.event\.pull_request\.`;
+/** An `if:` that admits only same-repo pull requests: fork PRs never run the
+ *  job, and actions/checkout's own guard exempts same-repo PRs too. */
+const PRT_SAME_REPO_IF = new RegExp(
+  [
+    GH_PR + String.raw`head\.repo\.full_name\s*==\s*github\.repository(?![\w.])`,
+    String.raw`(?<![\w.])github\.repository\s*==\s*` + GH_PR + String.raw`head\.repo\.full_name(?![\w.])`,
+    GH_PR + String.raw`head\.repo\.fork\s*==\s*false\b`,
+    String.raw`!\s*` + GH_PR + String.raw`head\.repo\.fork(?![\w.])(?!\s*[!=]=)`,
+  ].join("|")
+);
+/** An `if:` that admits only merged pull requests (merged == true, or a bare
+ *  truthy `merged`; not `!merged` or `merged == false`). */
+const PRT_MERGED_IF = new RegExp(
+  String.raw`(?<!!\s{0,4})(?<![\w.])` + GH_PR + String.raw`merged(?:\s*==\s*true\b|(?![\w.])(?!\s*[!=]=))`
+);
+
+/** Does this `if:` keep fork pull request code out? An `||` or a negated
+ *  group can let other cases in, so neither counts. `merged` counts only
+ *  when the trigger runs on `closed` alone: after a merge, the head and the
+ *  merge commit are code the base branch accepted. */
+function prtIfKeepsForksOut(expr: string | null, closedOnly: boolean): boolean {
+  if (!expr || /\|\||!\s*\(/.test(expr)) return false;
+  return PRT_SAME_REPO_IF.test(expr) || (closedOnly && PRT_MERGED_IF.test(expr));
+}
+
+/**
+ * Should the live match on line ln (at column col) be skipped?
+ *  - It is the value of a `with:` input, under a key other than `ref`, of a
+ *    step whose action is not a checkout action: data handed to that action
+ *    (a coverage upload's branch name, a status target), not a checkout.
+ *  - Its step or its job has an `if:` that keeps fork pull requests out.
+ */
+function prtSkipMatch(lines: string[], ln: number, col: number, closedOnly: boolean): boolean {
+  const k = /^(\s*)([\w-]+)\s*:/.exec(lines[ln]);
+  if (k && k[2] !== "ref" && col >= k[1].length) {
+    let parent = -1;
+    for (let i = ln - 1; i >= 0; i--) {
+      if (wfBlank(lines[i])) continue;
+      if (wfIndent(lines[i]) < k[1].length) {
+        parent = i;
+        break;
+      }
+    }
+    if (parent >= 0 && /^\s*with\s*:\s*(?:#.*)?$/.test(lines[parent])) {
+      const item = wfItemAt(lines, parent);
+      if (item >= 0) {
+        const end = wfBlockEnd(lines, item, wfIndent(lines[item]));
+        const uses = wfKeyValue(lines, item, end, wfItemCol(lines, item), "uses");
+        if (uses !== null && !/checkout/i.test(uses)) return true;
+      }
+    }
+  }
+  const item = wfItemAt(lines, ln);
+  if (item >= 0) {
+    const end = wfBlockEnd(lines, item, wfIndent(lines[item]));
+    if (prtIfKeepsForksOut(wfKeyValue(lines, item, end, wfItemCol(lines, item), "if"), closedOnly)) {
+      return true;
+    }
+  }
+  const job = wfJobAt(lines, ln);
+  return !!job && prtIfKeepsForksOut(wfKeyValue(lines, job.head + 1, job.end, job.col, "if"), closedOnly);
+}
 
 /** Curated, conservative advisory list (sample set for the MVP).
  *  `fixedBelow` = a single global floor (simple deps). `fixedByMajor` = a floor
@@ -2017,9 +2266,9 @@ export const generalRules: Rule[] = [
     category: "general",
     cwe: "CWE-829",
     message:
-      "This workflow is triggered by pull_request_target — which runs with the BASE repository's secrets and a read/write GITHUB_TOKEN — and then explicitly checks out the pull request HEAD, i.e. code from the contributor's fork. Anyone who can open a pull request can therefore run their own code with your secrets in scope.",
+      "This workflow is triggered by pull_request_target — which runs with the BASE repository's secrets and a read/write GITHUB_TOKEN — and then explicitly checks out the pull request HEAD or its merge commit, i.e. code from the contributor's fork. Anyone who can open a pull request can therefore run their own code with your secrets in scope. Current actions/checkout releases refuse to check out a fork pull request's head or merge commit (as a SHA, as refs/pull/N/head or refs/pull/N/merge, or with the fork as repository) unless the step sets allow-unsafe-pr-checkout: true. That guard does not check a head.ref branch name, does not apply to other checkout actions, and does not cover actions/checkout@v1, a checkout pinned to a SHA or to a minor or patch version from before the July 2026 backport, or a git or gh fetch in a run step.",
     recommendation:
-      "Either switch the trigger to pull_request (fork PRs get no secrets there), or keep pull_request_target but do NOT check out the PR head — split the job so that any step touching untrusted code runs without secrets, and pass results between jobs via artifacts.",
+      "Either switch the trigger to pull_request (fork PRs get no secrets there), or keep pull_request_target but do NOT check out the PR head — split the job so that any step touching untrusted code runs without secrets, and pass results between jobs via artifacts. Do not set allow-unsafe-pr-checkout: true just to clear the \"Refusing to check out fork pull request code\" error: that turns the check back off.",
     reference:
       "https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/",
     appliesTo: (f) => IS_WORKFLOW.test(f.path),
@@ -2028,16 +2277,52 @@ export const generalRules: Rule[] = [
       // repo and is safe; a head checkout under an ordinary pull_request trigger
       // gets no secrets. Only the pair is dangerous — and requiring the pair is
       // what keeps this rule near-zero-false-positive.
-      if (!PRT_TRIGGER.test(f.content)) return [];
-      const m = PR_HEAD_CHECKOUT.exec(f.content);
-      if (!m) return [];
-      return [
-        {
-          line: lineAt(f.content, m.index),
-          column: columnAt(f.content, m.index),
-          snippet: snippetAt(f.content, m.index),
-        },
-      ];
+      const c = f.content;
+      if (!PRT_TRIGGER.test(c)) return [];
+      // Report the first head checkout that is not inside a `#` comment and
+      // not skipped by prtSkipMatch. Line starts and the comment scan move
+      // forward only, so a long line with many matches stays linear.
+      const re = new RegExp(PR_HEAD_CHECKOUT.source, PR_HEAD_CHECKOUT.flags);
+      let ls = 0; // start of the line holding the current match
+      let ln = 0; // its 0-based line number
+      let nextNl = c.indexOf("\n");
+      const scan: WfScan = { pos: 0, q: "", at: -1 }; // comment scan of line `ls`
+      let lines: string[] | null = null;
+      let closedOnly = false;
+      let checked = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(c)) !== null) {
+        if (nextNl !== -1 && nextNl < m.index) {
+          while (nextNl !== -1 && nextNl < m.index) {
+            ls = nextNl + 1;
+            ln++;
+            nextNl = c.indexOf("\n", ls);
+          }
+          scan.pos = ls;
+          scan.q = "";
+          scan.at = -1;
+        }
+        wfScanTo(c, ls, scan, m.index);
+        if (scan.at >= 0) continue;
+        // The structural lookups walk back through the file, so they run for
+        // at most 50 live matches; past that the rule reports (fails closed).
+        if (++checked <= 50) {
+          if (!lines) {
+            lines = c.split("\n").map((l) => l.replace(/\r$/, ""));
+            const types = prtTypes(lines);
+            closedOnly = !!types && types.length > 0 && types.every((t) => t === "closed");
+          }
+          if (prtSkipMatch(lines, ln, m.index - ls, closedOnly)) continue;
+        }
+        return [
+          {
+            line: lineAt(c, m.index),
+            column: columnAt(c, m.index),
+            snippet: snippetAt(c, m.index),
+          },
+        ];
+      }
+      return [];
     },
   },
 ];

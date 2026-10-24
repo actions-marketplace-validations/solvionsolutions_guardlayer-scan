@@ -34,6 +34,21 @@ function isCommentedOut(content: string, idx: number): boolean {
   return /^\s*(\/\*|\*)/.test(before);
 }
 
+// Is `idx` inside a '…' / "…" / `…` literal opened earlier on its line? A
+// config snippet quoted in a string ("remotePatterns: [{ hostname: '*' }]")
+// configures nothing.
+function inStringOnLine(content: string, idx: number): boolean {
+  let q = "";
+  for (let i = content.lastIndexOf("\n", idx - 1) + 1; i < idx; i++) {
+    const c = content[i];
+    if (q) {
+      if (c === "\\") i++;
+      else if (c === q) q = "";
+    } else if (c === "'" || c === '"' || c === "`") q = c;
+  }
+  return q !== "";
+}
+
 const imageOptimizerOff = (content: string) => {
   for (const m of content.matchAll(IMAGE_OPTIMIZER_OFF)) {
     if (!isCommentedOut(content, m.index ?? 0)) return true;
@@ -1539,9 +1554,9 @@ export const nextjsRules: Rule[] = [
     category: "nextjs",
     cwe: "CWE-918",
     message:
-      "images.remotePatterns allows ANY host ('**'). /_next/image is a server-side fetcher: with a match-everything allow-list, anyone can make your deployment fetch and re-encode images from any URL (bandwidth and compute you pay for), and every URL counts as allow-listed — the precondition for image-optimizer SSRF bugs such as CVE-2026-94483 (Sept 2026, High). On Next.js 16, private IPs stay blocked unless dangerouslyAllowLocalIP is set; this flags the over-broad allow-list in your config, not a confirmed exploit.",
+      "images.remotePatterns allows ANY host: a hostname of '*' or '**' matches every hostname, and '*.*' (or '**.*', '*.**', '**.**') every hostname that contains a dot. /_next/image is a server-side fetcher: with a match-everything allow-list, anyone can make your deployment fetch and re-encode images from any URL (bandwidth and compute you pay for), and every URL counts as allow-listed — the precondition for image-optimizer SSRF bugs such as CVE-2026-94483 (Sept 2026, High). On Next.js 16, private IPs stay blocked unless dangerouslyAllowLocalIP is set; this flags the over-broad allow-list in your config, not a confirmed exploit.",
     recommendation:
-      "List the exact hosts you serve images from (e.g. { protocol: 'https', hostname: '<ref>.supabase.co', pathname: '/storage/v1/object/public/**' }). Scoped wildcards like '**.example.com' are fine. If you truly must render arbitrary user-supplied image URLs, set unoptimized on those <Image>s instead of opening the optimizer to the whole internet.",
+      "List the exact hosts you serve images from (e.g. { protocol: 'https', hostname: '<ref>.supabase.co', pathname: '/storage/v1/object/public/**' }). A single '*' is not narrower than '**': in Next.js both match every hostname when used alone, and '*.example.com' also matches deeper names such as a.b.example.com. A scoped wildcard is only as safe as the domain under it: '**.example.com' is reasonable when you control every subdomain of example.com, but on a shared multi-tenant domain such as '*.supabase.co' or '*.vercel.app' it allow-lists every other customer's project too, so pin your own project host instead. If you truly must render arbitrary user-supplied image URLs, set unoptimized on those <Image>s instead of opening the optimizer to the whole internet.",
     reference:
       "https://nextjs.org/docs/app/api-reference/components/image#remotepatterns",
     appliesTo: isNextConfig,
@@ -1549,22 +1564,36 @@ export const nextjsRules: Rule[] = [
       const src = f.content;
       if (!/remotePatterns/.test(src) || imageOptimizerOff(src)) return [];
       const out: RuleMatch[] = [];
-      // Exactly '**' as the WHOLE hostname, or the URL-object form
-      // new URL('https://**...'). A scoped '**.example.com' never matches (the
-      // closing quote must follow '**' directly), and a bare '*' is deliberately
-      // excluded — it matches a single label, not every host.
+      // '*' or '**' as the WHOLE hostname, or the URL-object form
+      // new URL('https://*...') / new URL('https://**...'). Next.js tests the
+      // hostname with picomatch.makeRe(hostname) (shared/lib/match-remote-pattern),
+      // and picomatch only treats '/' as a separator, never '.', so a bare '*'
+      // matches every hostname exactly like '**' (verified on next 16.4.2:
+      // both accept evil.com, a.b.c.evil.com, localhost and 169.254.169.254).
+      // The docs say '*' matches a single subdomain, but it spans dots there
+      // too: '*.example.com' also accepts a.b.example.com. A scoped
+      // '*.example.com' / '**.example.com' never matches this regex: the
+      // closing quote (or '/', ':' in the URL form) must follow the stars.
+      // Two star groups joined by one dot ('*.*', '**.*', '*.**', '**.**')
+      // accept every hostname that contains a dot (same check; '*.*.*' does
+      // not accept evil.com, so it is not matched). A quoted key
+      // ("hostname": "*") counts; a concatenation ('*' + '.example.com') does
+      // not, nor a config quoted inside a string or a block comment.
       const re =
-        /\bhostname\s*:\s*(['"`])\*\*\1|\bnew\s+URL\(\s*(['"`])https?:\/\/\*\*(?=[\/'"`:])/g;
+        /["']?\bhostname["']?\s*:\s*(['"`])(\*{1,2}(?:\.\*{1,2})?)\1(?!\s*\+)|\bnew\s+URL\(\s*(['"`])https?:\/\/(\*{1,2}(?:\.\*{1,2})?)(?=[\/:]|['"`](?!\s*\+))/g;
       let m: RegExpExecArray | null;
       let guard = 0;
       while ((m = re.exec(src)) !== null) {
         if (++guard > 200) break;
-        if (isCommentedOut(src, m.index)) continue;
+        if (isCommentedOut(src, m.index) || inBlockComment(src, m.index)) continue;
+        if (inStringOnLine(src, m.index)) continue;
+        const host = m[2] ?? m[4] ?? "**";
         out.push({
           line: lineAt(src, m.index),
           snippet: snippetAt(src, m.index),
-          message:
-            "images.remotePatterns allows any host ('**') — the image optimizer will fetch from anywhere.",
+          message: host.includes(".")
+            ? `images.remotePatterns allows every dotted host ('${host}') — the image optimizer will fetch from almost anywhere.`
+            : `images.remotePatterns allows any host ('${host}') — the image optimizer will fetch from anywhere.`,
         });
       }
       return out;

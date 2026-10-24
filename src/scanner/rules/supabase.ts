@@ -1684,6 +1684,460 @@ function efnaWebhookVerified(src: string): boolean {
   return false;
 }
 
+// ── @supabase/server: withSupabase and its primitives ───────────────────
+//
+// Supabase's "Securing Edge Functions" guide (docs/guides/functions/auth)
+// wraps the handler in withSupabase({ auth: <mode> }, handler) from
+// @supabase/server. The wrapper reads the Authorization and apikey headers
+// itself, so the file never calls headers.get("authorization"), and the
+// checks above used to flag the guide's own example. Modes, as read from
+// the package (v1.9.2: README, docs/auth-modes.md, src/core/
+// verify-credentials.ts, src/core/utils/deprecation.ts):
+//   'user'                                  a JWT verified against the
+//                                           project JWKS (the default)
+//   'secret' | 'secret:<name>' | 'secret:*' a secret API key on `apikey`
+//   'publishable' | 'publishable:<name>' | 'publishable:*'
+//                                           a PUBLIC key (shipped in every
+//                                           client), so not authentication
+//   'none'                                  every caller
+// An array tries each mode in order and admits whoever matches ANY of them,
+// so it authenticates only when EVERY entry does (['user', 'none'] is
+// "optional user"). Without an `auth` key the mode is `allow` (deprecated
+// alias), else 'user'. createSupabaseContext (package root) and verifyAuth
+// (@supabase/server/core) take the same option but return { data, error }
+// instead of rejecting, so they count only when the file returns or throws
+// on that error.
+//
+// The gate holds only when one of these names is imported from
+// @supabase/server, called at least once, and EVERY call (outside strings
+// and comments) has a config this code can read whose mode authenticates.
+// A config it cannot read (a spread, an imported object, a variable or
+// conditional mode, a shorthand { auth }, a computed or accessor key, a
+// `const` object that is touched again) keeps the rule firing, as does any
+// non-call use of the imported name (an alias) and, when a gate sits on one
+// router route or path prefix, any registered route it does not cover.
+// Known gaps, as for the gates above: a gated call that does not wrap the
+// served handler is still trusted, and so is .use(gate) inside a scoped
+// group (Elysia's .group('/api', …)).
+
+/** Where @supabase/server is imported from: the package (bare, npm:, or an
+ *  esm.sh URL, optionally versioned), its /core primitives or an adapter. */
+const EFNA_SBS_FROM =
+  /\bfrom\s{0,8}['"]((?:npm:|https?:\/\/esm\.sh\/)?@supabase\/server(?:@[\w.^~*-]{1,40})?(?:\/(?:core|adapters\/[a-z0-9-]{1,20}))?(?:\?[^'"\n]{0,80})?)['"]/g;
+const EFNA_SBS_WRAP = "withSupabase";
+const EFNA_SBS_PRIMS = new Set(["createSupabaseContext", "verifyAuth"]);
+
+const efnaSkipWs = (s: string, i: number, end: number) => {
+  while (i < end && /\s/.test(s[i])) i++;
+  return i;
+};
+
+/** A '…' / "…" / `…` literal starting at s[i]: [value, index after it], or
+ *  null for an unterminated literal or a template with ${…} in it. */
+function efnaStrLit(s: string, i: number, end: number): [string, number] | null {
+  const q = s[i];
+  let v = "";
+  for (let j = i + 1; j < end; j++) {
+    const ch = s[j];
+    if (ch === "\\") {
+      v += s[j + 1] ?? "";
+      j++;
+      continue;
+    }
+    if (ch === q) return [v, j + 1];
+    if (q === "`" && ch === "$" && s[j + 1] === "{") return null;
+    if (ch === "\n" && q !== "`") return null;
+    v += ch;
+  }
+  return null;
+}
+
+/** Index just past the string literal starting at s[i], or -1. */
+function efnaSkipStr(s: string, i: number, end: number): number {
+  const q = s[i];
+  for (let j = i + 1; j < end; j++) {
+    if (s[j] === "\\") {
+      j++;
+      continue;
+    }
+    if (s[j] === q) return j + 1;
+    if (s[j] === "\n" && q !== "`") return -1;
+  }
+  return -1;
+}
+
+/** The value of `auth:` / `allow:` at s[i]: one string literal or an array of
+ *  them (optionally `as const`), followed by `,` or `}`. Anything else is an
+ *  expression this code does not evaluate: null. */
+function efnaModeValue(s: string, i: number, end: number): [string[], number] | null {
+  const list: string[] = [];
+  let j = i;
+  const isQ = (c: string | undefined) => c === "'" || c === '"' || c === "`";
+  if (s[j] === "[") {
+    j = efnaSkipWs(s, j + 1, end);
+    for (let n = 0; n < 12 && s[j] !== "]"; n++) {
+      if (!isQ(s[j])) return null;
+      const lit = efnaStrLit(s, j, end);
+      if (!lit) return null;
+      list.push(lit[0]);
+      j = efnaSkipWs(s, lit[1], end);
+      if (s[j] === ",") j = efnaSkipWs(s, j + 1, end);
+      else if (s[j] !== "]") return null;
+    }
+    if (s[j] !== "]") return null;
+    j++;
+  } else if (isQ(s[j])) {
+    const lit = efnaStrLit(s, j, end);
+    if (!lit) return null;
+    list.push(lit[0]);
+    j = lit[1];
+  } else {
+    return null;
+  }
+  j = efnaSkipWs(s, j, end);
+  const asConst = /^as[ \t]{1,8}const\b/.exec(s.slice(j, j + 20));
+  if (asConst) j = efnaSkipWs(s, j + asConst[0].length, end);
+  return s[j] === "," || s[j] === "}" ? [list, j] : null;
+}
+
+/**
+ * The auth modes of the object literal opening at s[open]: its top-level
+ * `auth`, else `allow`, else the package default ['user']. Nested objects
+ * (cors headers, env) are skipped, strings are skipped whole. null when the
+ * object cannot be read: a spread, a shorthand auth key, any computed,
+ * numeric or accessor key (['auth'], get auth()), an unevaluated value, or
+ * no closing brace within 4000 characters.
+ */
+function efnaObjectModes(s: string, open: number): string[] | null {
+  const end = Math.min(s.length, open + 4000);
+  let auth: string[] | undefined;
+  let allow: string[] | undefined;
+  let depth = 0;
+  let expectKey = true;
+  let i = open + 1;
+  for (let steps = 0; i < end; steps++) {
+    if (steps > 8000) return null;
+    const ch = s[i];
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    if (depth === 0 && expectKey) {
+      expectKey = false;
+      if (s.startsWith("...", i)) return null;
+      let key: string | null = null;
+      let after = i;
+      if (ch === "'" || ch === '"') {
+        const lit = efnaStrLit(s, i, end);
+        if (!lit) return null;
+        key = lit[0];
+        after = lit[1];
+      } else {
+        const km = /^[A-Za-z_$][\w$]{0,63}/.exec(s.slice(i, i + 64));
+        if (km) {
+          key = km[0];
+          after = i + km[0].length;
+        } else if (ch !== "}") {
+          // A computed ['auth'] key, a numeric key or a generator method:
+          // which key it sets is not read here.
+          return null;
+        }
+      }
+      if (key !== null) {
+        const k = efnaSkipWs(s, after, end);
+        // get auth() { … } / set auth(v) / async auth(): an accessor or a
+        // method whose name follows the keyword, not a key named get/set.
+        if ((key === "get" || key === "set" || key === "async") && /[A-Za-z_$[\]'"*]/.test(s[k] ?? "")) {
+          return null;
+        }
+        if (key === "auth" || key === "allow") {
+          if (s[k] !== ":") return null;
+          const v = efnaModeValue(s, efnaSkipWs(s, k + 1, end), end);
+          if (!v) return null;
+          if (key === "auth") auth = v[0];
+          else allow = v[0];
+          i = v[1];
+          continue;
+        }
+        i = k;
+        continue;
+      }
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      const e = efnaSkipStr(s, i, end);
+      if (e < 0) return null;
+      i = e;
+      continue;
+    }
+    if (ch === "{" || ch === "[" || ch === "(") {
+      depth++;
+    } else if (ch === "}" || ch === "]" || ch === ")") {
+      if (depth === 0) {
+        if (ch !== "}") return null;
+        return auth !== undefined ? auth : allow !== undefined ? allow : ["user"];
+      }
+      depth--;
+    } else if (ch === "," && depth === 0) {
+      expectKey = true;
+    }
+    i++;
+  }
+  return null;
+}
+
+/**
+ * `s` with the inside of every string literal and every `//` comment blanked
+ * to spaces (quotes and newlines kept), so its indices line up with `s`. The
+ * gate searches this view for code, so text inside a string is never a call,
+ * and the column-0 `//` lines that stripJsComments keeps are gone. A template
+ * literal is blanked whole, ${…} included.
+ */
+function efnaCodeView(s: string): string {
+  const out: string[] = [];
+  let i = 0;
+  const blankTo = (to: number) => {
+    for (; i < to; i++) out.push(s[i] === "\n" ? "\n" : " ");
+  };
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "/" && s[i + 1] === "/") {
+      const nl = s.indexOf("\n", i);
+      blankTo(nl < 0 ? s.length : nl);
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      out.push(ch);
+      i++;
+      let j = i;
+      while (j < s.length && s[j] !== ch && (ch === "`" || s[j] !== "\n")) j += s[j] === "\\" ? 2 : 1;
+      blankTo(Math.min(j, s.length));
+      if (s[i] === ch) {
+        out.push(ch);
+        i++;
+      }
+      continue;
+    }
+    out.push(ch);
+    i++;
+  }
+  return out.join("");
+}
+
+/** The modes of the config argument at c: an object literal, or an
+ *  identifier bound exactly once by `const X = { … }` in the code (`let`, a
+ *  second binding or a commented-out one does not count). For an identifier
+ *  it also returns the name and where the declaration names it, so the gate
+ *  can check that nothing else touches the object. */
+function efnaConfigModes(
+  src: string,
+  code: string,
+  c: number
+): { modes: string[]; id?: string; declAt?: number } | null {
+  if (src[c] === "{") {
+    const modes = efnaObjectModes(src, c);
+    return modes ? { modes } : null;
+  }
+  const id = /^([A-Za-z_$][\w$]{0,63})\s{0,8}[,)]/.exec(code.slice(c, c + 80));
+  if (!id) return null;
+  const decl = new RegExp(
+    "\\b(const[ \\t]{1,8})" + efnaEsc(id[1]) + "[ \\t]{0,8}(?::[^=\\n]{1,80})?=[ \\t]{0,8}\\{",
+    "g"
+  );
+  const found: RegExpExecArray[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = decl.exec(code)) !== null && found.length < 2) found.push(m);
+  if (found.length !== 1) return null;
+  const modes = efnaObjectModes(src, found[0].index + found[0][0].length - 1);
+  return modes ? { modes, id: id[1], declAt: found[0].index + found[0][1].length } : null;
+}
+
+/** A mode that admits only callers holding a credential the public lacks. */
+const efnaModeAuthenticates = (mode: string) =>
+  mode === "user" || /^secret(?::[^\s'"`]{0,64})?$/.test(mode);
+
+/**
+ * createSupabaseContext / verifyAuth at `at` (its `(` at `open`) return
+ * { data, error }: the call gates only when its error is bound
+ * (`const { error } = await …`, `{ error: e }`, or `const r = await …` read
+ * as r.error) and the very next statement is `if (error …) return|throw`.
+ * A check further down can test another `error` (a catch parameter, a
+ * nested callback's) and does not prove this one is handled. `code` is the
+ * efnaCodeView text, so a commented-out check is not seen.
+ */
+function efnaPrimitiveRejects(code: string, at: number, open: number): boolean {
+  const s = code;
+  const back = s.slice(Math.max(0, at - 260), at);
+  let err: string;
+  const d = /\b(?:const|let|var)\s{1,8}\{([^{}]{0,200})\}\s{0,8}=\s{0,8}(?:await\s{1,8})?$/.exec(back);
+  if (d) {
+    const e = /(?:^|,)\s{0,40}error\s{0,8}(?::\s{0,8}([A-Za-z_$][\w$]{0,63}))?\s{0,8}(?=,|$)/.exec(d[1]);
+    if (!e) return false;
+    err = efnaEsc(e[1] ?? "error") + "\\b";
+  } else {
+    const v = /\b(?:const|let|var)\s{1,8}([A-Za-z_$][\w$]{0,63})\s{0,8}(?::[^=\n]{1,80})?=\s{0,8}(?:await\s{1,8})?$/.exec(back);
+    if (!v) return false;
+    err = "\\b" + efnaEsc(v[1]) + "\\s{0,8}\\??\\.\\s{0,8}error\\b";
+  }
+  // The end of the call: its matching `)` (strings are blank in `code`).
+  let end = -1;
+  for (let i = open, depth = 0; i < Math.min(s.length, open + 4000); i++) {
+    if (s[i] === "(") depth++;
+    else if (s[i] === ")" && --depth === 0) {
+      end = i + 1;
+      break;
+    }
+  }
+  if (end < 0) return false;
+  const reject = new RegExp(
+    "^[\\s;]{0,400}if\\s{0,8}\\(\\s{0,8}" +
+      err +
+      "\\s{0,8}(?:(?:!==|!=)\\s{0,8}(?:null|undefined)\\s{0,8})?(?:\\|\\|[^()\\n]{0,80})?\\)\\s{0,40}\\{?\\s{0,40}(?:return|throw)\\b"
+  );
+  return reject.test(s.slice(end, end + 800));
+}
+
+/** A gate call that is an argument of a router method with a path first:
+ *  app.get('/todos', withSupabase(…), handler) or app.use('/admin/*', …).
+ *  Up to four simple middleware arguments may come before it. */
+const EFNA_ROUTE_ARG =
+  /\.\s{0,8}(get|post|put|patch|delete|all|options|head|use)\s{0,8}\(\s{0,40}(['"`])([^'"`\n]{0,200})\2\s{0,40},\s{0,40}(?:[\w$.]{1,60}(?:\(\s{0,8}\))?\s{0,40},\s{0,40}){0,4}$/;
+/** A gate call that is the only argument of .use(…): middleware for every
+ *  route. */
+const EFNA_USE_ALL = /\.\s{0,8}use\s{0,8}\(\s{0,40}$/;
+/** A route registration with a path first: app.post('/wipe', handler). */
+const EFNA_ROUTE_REG =
+  /\.\s{0,8}(get|post|put|patch|delete|all|options|head)\s{0,8}\(\s{0,40}(['"`])([^'"`\n]{0,200})\2\s{0,40},/g;
+
+/** Is every @supabase/server gate in the file (and there is at least one)
+ *  configured with authenticating modes? */
+function efnaSupabaseServerGate(src: string): boolean {
+  if (src.indexOf("@supabase/server") === -1) return false;
+  // 1. Local names of withSupabase / the primitives imported from the package.
+  const wrap = new Set<string>();
+  const prim = new Set<string>();
+  const importSpans: [number, number][] = []; // `{ … } from '…'` of those imports
+  const from = new RegExp(EFNA_SBS_FROM.source, "g");
+  let m: RegExpExecArray | null;
+  let guard = 0;
+  while ((m = from.exec(src)) !== null) {
+    if (++guard > 20) break;
+    const win = src.slice(Math.max(0, m.index - 700), m.index);
+    const close = win.lastIndexOf("}");
+    if (close < 0 || !/^\s{0,8}$/.test(win.slice(close + 1))) continue;
+    const open = win.lastIndexOf("{", close);
+    if (open < 0) continue;
+    // A column-0 `// import { … }` survives stripJsComments (see below).
+    const absOpen = Math.max(0, m.index - 700) + open;
+    if (/^\s{0,200}\/\//.test(src.slice(src.lastIndexOf("\n", absOpen) + 1, absOpen))) continue;
+    // `import {` or `import Default, {`. `import type { … }` brings in no
+    // runtime value, so it does not match.
+    if (!/\bimport\s{1,8}(?:[A-Za-z_$][\w$]{0,63}\s{0,8},\s{0,8})?$|\bimport\{$/.test(win.slice(Math.max(0, open - 90), open))) {
+      continue;
+    }
+    for (const part of win.slice(open + 1, close).split(",").slice(0, 30)) {
+      const spec = /^\s*([A-Za-z_$][\w$]{0,63})(?:\s+as\s+([A-Za-z_$][\w$]{0,63}))?\s*$/.exec(part);
+      if (!spec || spec[1] === "type") continue;
+      const local = spec[2] ?? spec[1];
+      if (spec[1] === EFNA_SBS_WRAP) wrap.add(local);
+      else if (EFNA_SBS_PRIMS.has(spec[1])) prim.add(local);
+    }
+    importSpans.push([absOpen, m.index + m[0].length]);
+  }
+  if (wrap.size === 0 && prim.size === 0) return false;
+  // 2. Every reference to those names, outside strings and comments, must be
+  //    a call with a readable, authenticating config. Any other use (an
+  //    alias such as `const gate = withSupabase`, a pass-through, a
+  //    re-export) can hide calls this scan never sees. `typeof X` in a type
+  //    is fine.
+  const code = efnaCodeView(src);
+  const names = [...wrap, ...prim].slice(0, 10).map(efnaEsc);
+  const ref = new RegExp("(?:^|[^\\w$.])(" + names.join("|") + ")(?![\\w$])", "g");
+  const callOpen = /^[ \t]{0,8}(?:<[^<>()\n]{0,120}>)?[ \t]{0,8}\(/;
+  const idUses = new Map<string, { declAt: number; at: Set<number> }>();
+  let routeScoped = false; // a gate on one route (or one path prefix) only
+  let useAll = false; // a gate as middleware for every route
+  const scopedUse: string[] = []; // path prefixes gated by .use('/x/*', gate)
+  const gatedRoutes = new Set<number>(); // registrations with a gate argument
+  let calls = 0;
+  let seen = 0;
+  while ((m = ref.exec(code)) !== null) {
+    if (++seen > 40) return false;
+    const at = m.index + m[0].length - m[1].length;
+    if (importSpans.some(([a, b]) => at >= a && at < b)) continue;
+    const co = callOpen.exec(code.slice(at + m[1].length, at + m[1].length + 140));
+    if (!co) {
+      if (/\btypeof\s{1,8}$/.test(code.slice(Math.max(0, at - 20), at))) continue;
+      return false;
+    }
+    if (++calls > 20) return false;
+    const open = at + m[1].length + co[0].length - 1;
+    let c = efnaSkipWs(code, open + 1, Math.min(code.length, open + 41));
+    const isPrim = prim.has(m[1]);
+    if (isPrim) {
+      // (req, { auth: … }): step over the request argument.
+      const a = /^[\w$.]{1,60}\s{0,20},\s{0,40}/.exec(code.slice(c, c + 140));
+      if (!a) return false;
+      c += a[0].length;
+    }
+    const cfg = efnaConfigModes(src, code, c);
+    if (!cfg || cfg.modes.length === 0 || !cfg.modes.every(efnaModeAuthenticates)) return false;
+    if (cfg.id !== undefined && cfg.declAt !== undefined) {
+      const u = idUses.get(cfg.id) ?? { declAt: cfg.declAt, at: new Set<number>() };
+      u.at.add(c);
+      idUses.set(cfg.id, u);
+    }
+    if (isPrim && !efnaPrimitiveRejects(code, at, open)) return false;
+    // Router placement: app.get('/x', gate, h) or app.use('/x/*', gate) gates
+    // part of the app; app.use(gate) or app.use('*', gate) all of it.
+    const base = Math.max(0, at - 300);
+    const before = code.slice(base, at);
+    const r = EFNA_ROUTE_ARG.exec(before);
+    if (r) {
+      const q = base + r.index + r[0].indexOf(r[2]) + 1;
+      const path = src.slice(q, q + r[3].length);
+      if (r[1] === "use" && (path === "*" || path === "/*")) useAll = true;
+      else {
+        routeScoped = true;
+        if (r[1] === "use") scopedUse.push(path);
+        else gatedRoutes.add(base + r.index);
+      }
+    } else if (EFNA_USE_ALL.test(before)) {
+      useAll = true;
+    }
+  }
+  if (calls === 0) return false;
+  // 3. A config object bound by `const` must not be touched anywhere else:
+  //    Object.assign(config, …) or config.auth = 'none' changes the mode.
+  for (const [id, u] of idUses) {
+    const occ = new RegExp("(?:^|[^\\w$.])(" + efnaEsc(id) + ")(?![\\w$])", "g");
+    let n = 0;
+    while ((m = occ.exec(code)) !== null) {
+      if (++n > 40) return false;
+      const p = m.index + m[0].length - id.length;
+      if (p !== u.declAt && !u.at.has(p)) return false;
+    }
+  }
+  // 4. With a per-route gate, every route the file registers must be gated:
+  //    by its own gate argument, a .use() prefix that covers its path, or an
+  //    app-wide .use(). Hono's adapter docs show per-route gates beside an
+  //    open route, which is how an unguarded route slips past.
+  if (routeScoped && !useAll) {
+    const reg = new RegExp(EFNA_ROUTE_REG.source, "g");
+    let n = 0;
+    while ((m = reg.exec(code)) !== null) {
+      if (++n > 60) return false;
+      const q = m.index + m[0].indexOf(m[2]) + 1;
+      const path = src.slice(q, q + m[3].length);
+      if (!/^[/*]/.test(path) || gatedRoutes.has(m.index)) continue;
+      const covered = scopedUse.some(
+        (p) => p === path || (p.endsWith("*") && path.startsWith(p.slice(0, -1)))
+      );
+      if (!covered) return false;
+    }
+  }
+  return true;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // supabase/public-storage-bucket — internals (used by that rule only)
 //
@@ -2849,7 +3303,7 @@ export const supabaseRules: Rule[] = [
     message:
       "This Supabase Edge Function handles requests but never reads and verifies the Authorization header. Edge functions are publicly invocable by default.",
     recommendation:
-      "Verify the caller inside the function. For user calls, read the Authorization header, call supabase.auth.getUser(token) or auth.getClaims(token), and reject when there is no user. For cron, internal or webhook calls, compare a dedicated secret header (or the provider's signature) to a server-side secret, and fail closed when that secret is unset. verify_jwt = true alone is not enough, because the public anon key is a valid JWT.",
+      "Verify the caller inside the function. For user calls, wrap the handler in withSupabase({ auth: 'user' }, handler) from @supabase/server, or read the Authorization header, call supabase.auth.getUser(token) or auth.getClaims(token), and reject when there is no user. For cron or internal calls, use withSupabase({ auth: 'secret' }) (or 'secret:<name>') or compare a dedicated secret header to a server-side secret, and fail closed when that secret is unset. For provider webhooks, verify the provider's signature. The 'none' and 'publishable' modes do not authenticate the caller: a publishable key ships in every client. verify_jwt = true alone is not enough, because the public anon key is a valid JWT.",
     // Deployable code only: no _shared/_lib modules, no tests (efnaInScope).
     appliesTo: (f) => isEdgeFunction(f.path) && isJsLike(f) && efnaInScope(f.path),
     scan: (f) => {
@@ -2875,6 +3329,11 @@ export const supabaseRules: Rule[] = [
         EFNA_VERIFIES_JWT.test(src) ||
         (EFNA_DJWT_IMPORT.test(src) && /\bverify[ \t]{0,8}\(/.test(src));
       if (EFNA_READS_AUTH.test(src) && verifiesJwt) return [];
+      // Supabase's own wrapper: withSupabase({ auth: 'user' | 'secret…' })
+      // from @supabase/server (or its createSupabaseContext / verifyAuth
+      // primitives with the error handled). 'none' and 'publishable' modes
+      // authenticate nobody and fall through to the checks below.
+      if (efnaSupabaseServerGate(src)) return [];
       // A non-user caller authenticated by a secret or a webhook signature.
       if (efnaSecretGate(src)) return [];
       if (efnaWebhookVerified(src)) return [];
