@@ -284,9 +284,9 @@ function isWebhookTestFile(path: string): boolean {
 
 // Blank `//` and `/* */` comments to spaces (newlines kept, same length) so a
 // verifier named only in a TODO comment does not suppress, and indexes still
-// line up with the raw content. Deliberately NOT helpers.stripJsComments: its
-// /\/\*[\s\S]*?\*\// is quadratic on an unterminated `/*` and, without the m
-// flag, never strips a `//` comment at column 0. This is one linear pass that
+// line up with the raw content. Deliberately NOT helpers.stripJsComments: it
+// deletes `//` text (so offsets shift) and is not string-aware (a `/*` glob or
+// a " // " inside a string blanks live code). This is one linear pass that
 // skips string literals ('…' and "…" end at a newline) and leaves `://` URLs.
 function blankWebhookComments(c: string): string {
   const out = c.split("");

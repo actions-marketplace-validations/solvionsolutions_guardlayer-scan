@@ -744,6 +744,16 @@ export function sqlStatementEnd(src: string, from: number, cap = 8000): number {
  * Blank out JS/TS comments while PRESERVING line structure (so line numbers
  * computed against the original content still line up). Used by prose-sensitive
  * rules so a defensive comment that merely mentions a term isn't flagged.
+ *
+ * Contract:
+ *  - Block comments become spaces (newlines kept, same length). `//` comments
+ *    are removed to the end of their line, on every line, column 0 included.
+ *    Lines and columns line up with `content`; absolute offsets after the
+ *    first `//` comment do not.
+ *  - NOT string-aware. A `//` right after `:` or a quote is kept, so URLs
+ *    ("https://x") and '//cdn…' strings survive. Any other `//` starts a
+ *    comment, so "a // b" inside a string loses the rest of its line, and a
+ *    `/*` inside a string (an 'image/*' MIME type) blanks up to the next `*\/`.
  */
 export function stripJsComments(content: string): string {
   // Block comments: replace with same number of newlines + spaces. An indexOf
@@ -762,6 +772,28 @@ export function stripJsComments(content: string): string {
   }
   out += content.slice(copied);
   // Line comments (avoid http:// by requiring the // not be preceded by ':').
-  out = out.replace(/([^:"'`\n]|^)\/\/[^\n]*/g, (_m, p1: string) => p1);
+  // The m flag makes `^` match at every line start: without it a `//` at
+  // column 0 was only stripped on line 1 (`\n` is excluded from the class).
+  out = out.replace(/([^:"'`\n]|^)\/\/[^\n]*/gm, (_m, p1: string) => p1);
   return out;
+}
+
+/**
+ * `content` with every line that is ONLY a `//` comment (optional leading
+ * whitespace, then `//`) blanked to spaces: same length, newlines kept, so
+ * indexes, lines and columns all map 1:1 to `content`.
+ *
+ * The safe subset of stripJsComments, for rules that match on the raw text
+ * because a string-blind stripper can blank live code (an 'image/*' MIME type
+ * opens a fake block comment). A line that starts with `//` is never live
+ * code: it is a comment, or text inside a template literal or block comment.
+ * Trailing `code(); // …` comments and block comments are left as they are.
+ *
+ * A comment ends at any JS line terminator (\n, \r, U+2028, U+2029), as in
+ * JS, so code after a lone \r is not blanked. The whitespace prefix excludes
+ * them too: with `[^\S\n]*`, a run of \r made every position a line start
+ * that the prefix re-scanned (quadratic, 3.5 s on 50 KB of "\r").
+ */
+export function blankJsCommentLines(content: string): string {
+  return content.replace(/^[^\S\r\n\u2028\u2029]*\/\/[^\r\n\u2028\u2029]*/gm, (line) => " ".repeat(line.length));
 }

@@ -14,6 +14,7 @@ import {
   sqlStatementEnd,
   isTestPath,
   stripJsComments,
+  blankJsCommentLines,
   middlewareFileKind,
   isNextProxyCode,
   isProxyEntryPath,
@@ -1889,8 +1890,9 @@ function efnaObjectModes(s: string, open: number): string[] | null {
  * `s` with the inside of every string literal and every `//` comment blanked
  * to spaces (quotes and newlines kept), so its indices line up with `s`. The
  * gate searches this view for code, so text inside a string is never a call,
- * and the column-0 `//` lines that stripJsComments keeps are gone. A template
- * literal is blanked whole, ${…} included.
+ * and a `//` comment that stripJsComments keeps (one right after a quote or
+ * `:`, as in `'x'// withSupabase(…)`) is gone too. A template literal is
+ * blanked whole, ${…} included.
  */
 function efnaCodeView(s: string): string {
   const out: string[] = [];
@@ -2026,9 +2028,9 @@ function efnaSupabaseServerGate(src: string): boolean {
     if (close < 0 || !/^\s{0,8}$/.test(win.slice(close + 1))) continue;
     const open = win.lastIndexOf("{", close);
     if (open < 0) continue;
-    // A column-0 `// import { … }` survives stripJsComments (see below).
+    // A commented-out `// import { … }` never reaches here: src is
+    // stripJsComments output, which removes `//` comments at every column.
     const absOpen = Math.max(0, m.index - 700) + open;
-    if (/^\s{0,200}\/\//.test(src.slice(src.lastIndexOf("\n", absOpen) + 1, absOpen))) continue;
     // `import {` or `import Default, {`. `import type { … }` brings in no
     // runtime value, so it does not match.
     if (!/\bimport\s{1,8}(?:[A-Za-z_$][\w$]{0,63}\s{0,8},\s{0,8})?$|\bimport\{$/.test(win.slice(Math.max(0, open - 90), open))) {
@@ -2790,6 +2792,12 @@ export const supabaseRules: Rule[] = [
       // there backtracks against it (600 ms on 200 KB of spaces). 1000, not
       // 300, so a long allowedMimeTypes list before public: true still matches.
       const hit = /\b(?:createBucket|updateBucket)\s*\([^)]{0,1000}?["']?\bpublic["']?\s*:\s*true\b/g;
+      // Calls are matched with `//`-only lines blanked (same length, so every
+      // index is an index into f.content): a commented-out createBucket, or a
+      // commented-out `public: true` line inside a live call, is not a public
+      // bucket. Not stripJsComments: an 'image/*' MIME type in one call would
+      // blank the next call up to a later `*/`.
+      const live = blankJsCommentLines(f.content);
       // Comment-blanked text, for identifier resolution ONLY: it does not
       // keep offsets, so every line/column comes from f.content.
       let clean: string | null = null;
@@ -2797,7 +2805,7 @@ export const supabaseRules: Rule[] = [
       const resolved = new Map<string, ReturnType<typeof psbResolveIdentifier>>();
       let m: RegExpExecArray | null;
       let guard = 0;
-      while ((m = hit.exec(f.content)) !== null) {
+      while ((m = hit.exec(live)) !== null) {
         if (++guard > 500) {
           out.push({
             line: lineAt(f.content, m.index),
@@ -3316,10 +3324,11 @@ export const supabaseRules: Rule[] = [
       let base = src;
       // stripJsComments is not string-aware: a "*/*" string followed by any
       // later `*/` blanks the code between them, the handler included. In a
-      // function's entry file, look the handler up in the raw text instead.
+      // function's entry file, look the handler up in the raw text instead,
+      // with `//`-only lines blanked: a commented-out Deno.serve( is no handler.
       if (idx < 0 && efnaIsEntry(f.path)) {
-        idx = efnaFindHandler(f.content);
-        base = f.content;
+        base = blankJsCommentLines(f.content);
+        idx = efnaFindHandler(base);
       }
       if (idx < 0) return [];
       // A user JWT: the Authorization header read AND its signature verified.
