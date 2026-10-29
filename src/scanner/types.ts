@@ -27,6 +27,8 @@ export interface RuleMatch {
   /** Optional per-match overrides of the rule defaults. */
   message?: string;
   recommendation?: string;
+  /** Resolved in toFinding only; everything downstream reads finding.severity. */
+  severity?: Severity;
 }
 
 /** A scanning rule. */
@@ -89,7 +91,17 @@ export interface ScanReport {
     engineVersion: string;
     durationMs: number;
     claudeEnriched: boolean;
-    /** True when the scan hit its wall-clock budget and results are partial. */
+    /** True when results are partial: the scan hit its wall-clock budget, or
+     *  (full-repo scans) GitHub truncated the tree, the file cap was hit, or a
+     *  file couldn't be read. */
     truncated?: boolean;
+    /** Stored: a Free account's one-time preview scan of a private repo
+     *  (lib/github/private-preview-rules.ts). Set server-side before the
+     *  report is saved, never from a request. */
+    preview?: boolean;
+    /** Served, never stored: this copy of a preview has its file paths, line
+     *  numbers, code snippets and fixes removed (redactPreviewReport), because
+     *  the viewer isn't on a paid plan. */
+    gated?: boolean;
   };
 }

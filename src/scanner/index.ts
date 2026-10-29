@@ -53,6 +53,7 @@ function toFinding(rule: Rule, file: ScanFile, m: {
   snippet: string;
   message?: string;
   recommendation?: string;
+  severity?: Severity;
 }): Finding {
   return {
     // Include column + a snippet slice so two distinct matches on the same
@@ -60,7 +61,9 @@ function toFinding(rule: Rule, file: ScanFile, m: {
     id: `${rule.id}:${file.path}:${m.line}:${m.column ?? 0}:${(m.snippet || "").slice(0, 32)}`,
     ruleId: rule.id,
     title: rule.title,
-    severity: rule.severity,
+    // A rule may lower (or raise) the severity of one match; the finding id
+    // does not include it, so a re-graded match keeps its identity.
+    severity: m.severity ?? rule.severity,
     category: rule.category,
     message: m.message ?? rule.message,
     recommendation: m.recommendation ?? rule.recommendation,
@@ -97,7 +100,9 @@ export function runScan(files: ScanFile[], opts: RunScanOptions): ScanReport {
   const scannable = files.filter((f) => isScannable(f.path) && allowed(f.path));
   const findings: Finding[] = [];
   const perFileCount = new Map<string, number>();
-  const seen = new Set<string>();
+  // Finding id → its index in `findings`.
+  const seen = new Map<string, number>();
+  const sevRank: Record<Severity, number> = { critical: 0, warning: 1, info: 2 };
   let truncated = false;
 
   outer: for (const file of scannable) {
@@ -120,8 +125,18 @@ export function runScan(files: ScanFile[], opts: RunScanOptions): ScanReport {
       for (const m of matches) {
         if (m.line < 1) continue;
         const finding = toFinding(rule, file, m);
-        if (seen.has(finding.id)) continue;
-        seen.add(finding.id);
+        const prev = seen.get(finding.id);
+        if (prev !== undefined) {
+          // The id leaves out severity, so two matches a rule graded
+          // differently can collide (e.g. a view and a table in one GRANT).
+          // Keep the more severe one: which match came first must not decide
+          // whether the gate fails.
+          if (sevRank[finding.severity] < sevRank[findings[prev].severity]) {
+            findings[prev] = finding;
+          }
+          continue;
+        }
+        seen.set(finding.id, findings.length);
         findings.push(finding);
         perFileCount.set(file.path, (perFileCount.get(file.path) ?? 0) + 1);
       }
@@ -129,7 +144,6 @@ export function runScan(files: ScanFile[], opts: RunScanOptions): ScanReport {
   }
 
   // Order: severity desc, then file, then line.
-  const sevRank: Record<Severity, number> = { critical: 0, warning: 1, info: 2 };
   findings.sort(
     (a, b) =>
       sevRank[a.severity] - sevRank[b.severity] ||
@@ -141,11 +155,27 @@ export function runScan(files: ScanFile[], opts: RunScanOptions): ScanReport {
   const warning = findings.filter((f) => f.severity === "warning").length;
   const info = findings.filter((f) => f.severity === "info").length;
 
-  const penalty = findings.reduce(
-    (sum, f) => sum + SEVERITY_WEIGHT[f.severity],
-    0
-  );
-  const score = Math.max(0, Math.min(100, 100 - penalty));
+  // WHY: the score reflects distinct problems, not raw instance count. One
+  // warning rule repeated 149 times is one thing to fix, and must not score
+  // the same F as a leaked live key. Each (ruleId, severity) group costs its
+  // weight once, +25% per extra instance, capped at 2x. Grouping includes
+  // severity because a rule can re-grade single matches. The merge gate uses
+  // the counts below, never this score.
+  const groups = new Map<string, { severity: Severity; count: number }>();
+  for (const f of findings) {
+    const key = `${f.ruleId}\u0000${f.severity}`;
+    const g = groups.get(key);
+    if (g) g.count += 1;
+    else groups.set(key, { severity: f.severity, count: 1 });
+  }
+  let penalty = 0;
+  for (const { severity, count } of groups.values()) {
+    const w = SEVERITY_WEIGHT[severity];
+    penalty += Math.min(2 * w, w + 0.25 * w * (count - 1));
+  }
+  // Rounded: the 25% steps can be fractional (e.g. 31.25), but score is an
+  // int column in public.scans and is shown as "N/100" everywhere.
+  const score = Math.max(0, Math.min(100, Math.round(100 - penalty)));
   const blocked = critical > 0;
   const status: GateStatus = blocked
     ? "block"
